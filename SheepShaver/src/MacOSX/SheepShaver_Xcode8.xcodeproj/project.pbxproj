@@ -85,6 +85,7 @@
 		C72739C92E2BAA6500B1F165 /* HiddenInputFieldKeyboardAccessoryView.swift in Sources */ = {isa = PBXBuildFile; fileRef = C72739C82E2BAA5E00B1F165 /* HiddenInputFieldKeyboardAccessoryView.swift */; };
 		C73660E02E34C85D0055AA91 /* ButtonLayerView.swift in Sources */ = {isa = PBXBuildFile; fileRef = C73660DF2E34C8590055AA91 /* ButtonLayerView.swift */; };
 		C73660E22E34C9190055AA91 /* Button.swift in Sources */ = {isa = PBXBuildFile; fileRef = C73660E12E34C9170055AA91 /* Button.swift */; };
+		C73660E42E34DCE40055AA91 /* Extensions.swift in Sources */ = {isa = PBXBuildFile; fileRef = C73660E32E34DCE30055AA91 /* Extensions.swift */; };
 		C7BC1A5F2E2562DC006F95CB /* SSDiskManager.mm in Sources */ = {isa = PBXBuildFile; fileRef = C7BC1A5E2E2562B4006F95CB /* SSDiskManager.mm */; };
 		C7BC1A622E25779B006F95CB /* HiddenInputFieldDelegate.swift in Sources */ = {isa = PBXBuildFile; fileRef = C7BC1A612E257794006F95CB /* HiddenInputFieldDelegate.swift */; };
 		C7BC1A642E2A84B2006F95CB /* MonitorResolutions.swift in Sources */ = {isa = PBXBuildFile; fileRef = C7BC1A632E2A84AA006F95CB /* MonitorResolutions.swift */; };
@@ -507,6 +508,7 @@
 		C72739C82E2BAA5E00B1F165 /* HiddenInputFieldKeyboardAccessoryView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HiddenInputFieldKeyboardAccessoryView.swift; sourceTree = "<group>"; };
 		C73660DF2E34C8590055AA91 /* ButtonLayerView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ButtonLayerView.swift; sourceTree = "<group>"; };
 		C73660E12E34C9170055AA91 /* Button.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Button.swift; sourceTree = "<group>"; };
+		C73660E32E34DCE30055AA91 /* Extensions.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Extensions.swift; sourceTree = "<group>"; };
 		C7BC1A5E2E2562B4006F95CB /* SSDiskManager.mm */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.objcpp; path = SSDiskManager.mm; sourceTree = "<group>"; };
 		C7BC1A602E2562E1006F95CB /* SSDiskManager.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = SSDiskManager.h; sourceTree = "<group>"; };
 		C7BC1A612E257794006F95CB /* HiddenInputFieldDelegate.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HiddenInputFieldDelegate.swift; sourceTree = "<group>"; };
@@ -1220,6 +1222,7 @@
 			isa = PBXGroup;
 			children = (
 				C7E2AFBF2E19629A00CF50D4 /* SDLKey.swift */,
+				C73660E32E34DCE30055AA91 /* Extensions.swift */,
 				C7BC1A652E2A8776006F95CB /* Monitor Resolutions */,
 				C7E2AFB72E16C54E00CF50D4 /* Overlay */,
 			);
@@ -1755,6 +1758,7 @@
 				E204B97728BC3EBE0081FDCA /* disk_sparsebundle.cpp in Sources */,
 				E204B97828BC3EBE0081FDCA /* tinyxml2.cpp in Sources */,
 				C7E2AFB92E16C55C00CF50D4 /* OverlayViewControllerObjC.mm in Sources */,
+				C73660E42E34DCE40055AA91 /* Extensions.swift in Sources */,
 				E204B97928BC3EBE0081FDCA /* DiskType.m in Sources */,
 				E204B97A28BC3EBE0081FDCA /* sigsegv.cpp in Sources */,
 				E204B97B28BC3EBE0081FDCA /* video_blit.cpp in Sources */,
