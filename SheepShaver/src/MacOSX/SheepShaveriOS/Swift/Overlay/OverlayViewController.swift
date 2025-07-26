@@ -90,45 +90,14 @@ public class OverlayViewController: UIViewController {
 	private let releaseKey: ((Int) -> Void)
 	private let pushAndReleaseKey: ((Int) -> Void)
 
-	@objc
-	public static func injectOverlayViewController(
+	init(
 		pushKey: @escaping ((Int) -> Void),
 		releaseKey: @escaping ((Int) -> Void),
 		pushAndReleaseKey: @escaping ((Int) -> Void)
 	) {
-		guard let window = UIApplication.shared.delegate?.window,
-		let sdlVC = window?.rootViewController else {
-			return
-		}
-
-		let vc = OverlayViewController(
-			testPushed: pushKey,
-			testReleased: releaseKey,
-			testRaw: pushAndReleaseKey
-		)
-
-		vc.willMove(toParent: sdlVC)
-		sdlVC.view.addSubview(vc.view)
-
-		NSLayoutConstraint.activate([
-			vc.view.leadingAnchor.constraint(equalTo: sdlVC.view.leadingAnchor),
-			vc.view.trailingAnchor.constraint(equalTo: sdlVC.view.trailingAnchor),
-			vc.view.topAnchor.constraint(equalTo: sdlVC.view.topAnchor),
-			vc.view.bottomAnchor.constraint(equalTo: sdlVC.view.bottomAnchor)
-		])
-
-		sdlVC.addChild(vc)
-		vc.didMove(toParent: sdlVC)
-	}
-
-	init(
-		testPushed: @escaping ((Int) -> Void),
-		testReleased: @escaping ((Int) -> Void),
-		testRaw: @escaping ((Int) -> Void)
-	) {
-		self.pushKey = testPushed
-		self.releaseKey = testReleased
-		self.pushAndReleaseKey = testRaw
+		self.pushKey = pushKey
+		self.releaseKey = releaseKey
+		self.pushAndReleaseKey = pushAndReleaseKey
 
 		super.init(nibName: nil, bundle: nil)
 	}
@@ -243,6 +212,39 @@ public class OverlayViewController: UIViewController {
 	}
 }
 
+extension OverlayViewController {
+	@objc
+	public static func injectOverlayViewController(
+		pushKey: @escaping ((Int) -> Void),
+		releaseKey: @escaping ((Int) -> Void),
+		pushAndReleaseKey: @escaping ((Int) -> Void)
+	) {
+		guard let window = UIApplication.shared.delegate?.window,
+		let sdlVC = window?.rootViewController else {
+			return
+		}
+
+		let vc = OverlayViewController(
+			pushKey: pushKey,
+			releaseKey: releaseKey,
+			pushAndReleaseKey: pushAndReleaseKey
+		)
+
+		vc.willMove(toParent: sdlVC)
+		sdlVC.view.addSubview(vc.view)
+
+		NSLayoutConstraint.activate([
+			vc.view.leadingAnchor.constraint(equalTo: sdlVC.view.leadingAnchor),
+			vc.view.trailingAnchor.constraint(equalTo: sdlVC.view.trailingAnchor),
+			vc.view.topAnchor.constraint(equalTo: sdlVC.view.topAnchor),
+			vc.view.bottomAnchor.constraint(equalTo: sdlVC.view.bottomAnchor)
+		])
+
+		sdlVC.addChild(vc)
+		vc.didMove(toParent: sdlVC)
+	}
+}
+
 extension OverlayViewController: UIGestureRecognizerDelegate {
 	public func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer, shouldReceive touch: UITouch) -> Bool {
 		return true
@@ -262,3 +264,5 @@ extension NSObject {
 		"\(Unmanaged.passUnretained(self).toOpaque())"
 	}
 }
+
+
