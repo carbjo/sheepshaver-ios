@@ -37,36 +37,16 @@
 #include "gfxaccel_resources_heap.h"
 #include "display_mode_controller.h"   /* DMCOwner enum + dmc_set_active_owner signature */
 
-#include <stdatomic.h>                  /* _Atomic uint32_t bg/fg pending flag */
+#include <atomic>                       /* std::atomic for bg/fg pending flag */
 
-/* MainDevice PixMap redirect/restore helpers
- * defined in dsp_draw_context.mm. The forward declarations live here so
- * the dsp_engine.cpp translation unit can call them from the emul-thread
- * bridge sites; the DSp-Active PixMap redirect must be
- * dropped BEFORE the back_buffer goes away and re-applied at foreground
- * resume.
- *
- * Threading note: DSpOnBackground / DSpOnForeground below run from the
+/* Threading note: DSpOnBackground / DSpOnForeground below run from the
  * UIKit lifecycle hook and only flip an atomic. In the current iOS build the
  * hook and emulation share the main==emul thread, so the atomic is primarily
- * a re-entry deferral gate: the actual table walk + PixMap mutation must run
- * later from DSpHandleBackgroundFromEmulThread /
- * DSpHandleForegroundFromEmulThread (in dsp_draw_context.mm), not inside the
- * notification callback. The references below in DSpOnBackground /
- * DSpOnForeground are documentation-only. */
-extern "C" void DSpRedirectMainDevicePixMap(struct DSpContextPrivate *ctx);
-extern "C" void DSpRestoreMainDevicePixMap(struct DSpContextPrivate *ctx);
-
-/* Forward decl for the 5th VBL secondary callback, the
- * VBL-driven auto-publish shim. Defined in dsp_draw_context.mm (next to
- * DSpVBLServiceCallback so the VBL callbacks are co-located). The
- * register/unregister pair below in DSpInit / DSpShutdownHandler is the
- * only call site — secondary-callback fan-out is owned by vbl_source.mm
- * after registration. */
-extern "C" void DSpVBLCompositorPublishCallback(void *cb_ctx,
-                                                 void *drawable,
-                                                 double ts);
-
+ * a re-entry deferral gate: the context table walk, resource release and
+ * guest Display Manager state transition run later from
+ * DSpHandleBackgroundFromEmulThread /
+ * DSpHandleForegroundFromEmulThread (in dsp_draw_context.cpp), not inside the
+ * notification callback. */
 #if ACCEL_LOGGING_ENABLED
 #ifdef __APPLE__
 os_log_t dsp_log = OS_LOG_DEFAULT;
@@ -80,7 +60,7 @@ static struct DSpLogInit {
 #endif
 
 /* Diagnostic logging is enabled by default for graphics diagnostics. */
-bool dsp_logging_enabled = accel_log_detail::subsystem_on("dsp");
+bool dsp_logging_enabled = accel_log_subsystem_on("dsp");
 #endif /* ACCEL_LOGGING_ENABLED */
 
 /*
@@ -88,7 +68,7 @@ bool dsp_logging_enabled = accel_log_detail::subsystem_on("dsp");
  *
  *    - dsp_registered: flipped true once DSpInit runs; used by
  *      DSpIsRegistered() and by matching Shutdown teardown. Distinct
- *      from dsp_startup_refcount — DSpInit is the PPC-thread bring-up
+ *      from dsp_startup_refcount - DSpInit is the PPC-thread bring-up
  *      hook (VideoInstallAccel), DSpStartup/Shutdown is the emulated-app
  *      lifecycle refcount.
  *    - dsp_startup_refcount: Startup/Shutdown call count. The
@@ -118,10 +98,10 @@ typedef int16 (*DSpReplaceGestaltProc)(uint32, uint32, uint32);
  *  Written by main-thread (observer hook via gfxaccel_resources.mm C shim);
  *  read + cleared by emul-thread (VBL secondary-callback drain chain in
  *  dsp_draw_context.mm, or the synchronous drain below). Matches the
- *  memory-warning single-word atomic pattern — _Atomic counters are the ONE
+ *  memory-warning single-word atomic pattern - _Atomic counters are the ONE
  *  sanctioned DSp concurrency primitive; no mutex / @synchronized.
  */
-static _Atomic uint32_t s_dsp_bg_fg_pending = 0;
+static std::atomic<uint32_t> s_dsp_bg_fg_pending{0};
 
 /* ---------------------------------------------------------------------- *
  *  Background / Foreground hook bodies                                  *
@@ -135,8 +115,8 @@ static _Atomic uint32_t s_dsp_bg_fg_pending = 0;
  *  DSpDrainLifecycleSync. The synchronous drain is required on the
  *  background edge: gfxaccel_handle_background_enter pauses the VBL
  *  source before this hook runs, so the VBL drain chain that used to be
- *  the sole consumer can never fire while backgrounded — back buffers
- *  were never released and the PixMap redirect never dropped.
+ *  the sole consumer can never fire while backgrounded - back buffers
+ *  were never released and the guest display state never paused.
  *  DSpDrainLifecycleSync defers to the in-flight tick when called inside
  *  the VBL callback chain, and SwapBuffers' re-entry revalidation
  *  (DSpRevalidateSwapContext) defends the table against drains landing
@@ -144,8 +124,7 @@ static _Atomic uint32_t s_dsp_bg_fg_pending = 0;
  */
 static void DSpOnBackground(void * /*ctx*/)
 {
-	atomic_fetch_or_explicit(&s_dsp_bg_fg_pending, kDSpPendingBackground,
-	                         memory_order_release);
+	s_dsp_bg_fg_pending.fetch_or(kDSpPendingBackground, std::memory_order_release);
 	DSP_LOG("OnBackground: pending bit set; draining synchronously");
 	/* GPU work was already drained by gfxaccel_handle_background_enter
 	 * (Step 2 waitUntilCompleted) before this hook (Step 4), so the
@@ -155,8 +134,7 @@ static void DSpOnBackground(void * /*ctx*/)
 
 static void DSpOnForeground(void * /*ctx*/)
 {
-	atomic_fetch_or_explicit(&s_dsp_bg_fg_pending, kDSpPendingForeground,
-	                         memory_order_release);
+	s_dsp_bg_fg_pending.fetch_or(kDSpPendingForeground, std::memory_order_release);
 	DSP_LOG("OnForeground: pending bit set; draining synchronously");
 	/* Synchronous drain re-allocates back buffers immediately so the
 	 * first post-resume frame presents instead of waiting one VBL; if a
@@ -167,15 +145,14 @@ static void DSpOnForeground(void * /*ctx*/)
 
 /*
  *  VBL-drain bridge. Called from DSpVBLBackgroundForegroundDrain in
- *  dsp_draw_context.mm — isolates s_dsp_bg_fg_pending so the draw-context
+ *  dsp_draw_context.mm - isolates s_dsp_bg_fg_pending so the draw-context
  *  file doesn't need to know about the atomic. atomic_exchange clears the
  *  slot with acquire semantics so the drain sees every release-store the
  *  lifecycle hook performed.
  */
 extern "C" uint32_t DSpExchangeBgFgPending(void)
 {
-	return atomic_exchange_explicit(&s_dsp_bg_fg_pending, 0u,
-	                                 memory_order_acquire);
+	return s_dsp_bg_fg_pending.exchange(0u, std::memory_order_acquire);
 }
 
 /* --- gfxaccel_resources fan-out handlers (no-op stubs).
@@ -183,25 +160,25 @@ extern "C" uint32_t DSpExchangeBgFgPending(void)
  *  The context-lifecycle code replaces these with real attach/detach
  *  that pre-vend / release DSp front-buffer Metal textures when DSp has
  *  an active context. Until the engine has resources,
- *  both callbacks always return kGfxAccelResNoErr (0) — the mode
+ *  both callbacks always return kGfxAccelResNoErr (0) - the mode
  *  transition is unconditionally accepted.
  *
  *  Both handlers must NOT call back into DMC (the resource manager
  *  fan-out runs on the DMC writer's thread while holding the writer
- *  mutex — recursive subscribe/unsubscribe would deadlock; matches the
+ *  mutex - recursive subscribe/unsubscribe would deadlock; matches the
  *  RAVE threat model cited in rave_engine.cpp).
  */
 static int32_t DSpOnAttach(uint32_t /* engine_id */,
-                           const struct DMCModeSnapshot * /* incoming */,
-                           void * /* ctx */)
+						   const struct DMCModeSnapshot * /* incoming */,
+						   void * /* ctx */)
 {
 	/* No DSp resources yet; always accept the mode transition. */
 	return 0;  /* kGfxAccelResNoErr */
 }
 
 static int32_t DSpOnDetach(uint32_t /* engine_id */,
-                           const struct DMCModeSnapshot * /* outgoing */,
-                           void * /* ctx */)
+						   const struct DMCModeSnapshot * /* outgoing */,
+						   void * /* ctx */)
 {
 	/* No DSp resources to release. */
 	return 0;
@@ -231,9 +208,9 @@ static uint32_t DSpAllocateGestaltCallback(uint32_t value)
 
 	const uint32_t r3 = 3, r4 = 4, r5 = 5;
 	WriteMacInt32(code + 0, 0x3C000000 | (r5 << 21) |
-	                         ((value >> 16) & 0xFFFF));
+							 ((value >> 16) & 0xFFFF));
 	WriteMacInt32(code + 4, 0x60000000 | (r5 << 21) |
-	                         (r5 << 16) | (value & 0xFFFF));
+							 (r5 << 16) | (value & 0xFFFF));
 	WriteMacInt32(code + 8, 0x90000000 | (r5 << 21) | (r4 << 16));
 	WriteMacInt32(code + 12, 0x38000000 | (r3 << 21));
 	WriteMacInt32(code + 16, 0x4E800020);
@@ -276,9 +253,9 @@ static void DSpRegisterGestaltVersion(void)
 
 	if (new_gestalt_tvect != 0) {
 		const int16 gerr = (int16)CallMacOS2(DSpNewGestaltProc,
-		                                     new_gestalt_tvect,
-		                                     kDSpGestaltSelector,
-		                                     dsp_gestalt_callback);
+											 new_gestalt_tvect,
+											 kDSpGestaltSelector,
+											 dsp_gestalt_callback);
 		if (gerr == 0) {
 			dsp_gestalt_registered = true;
 			return;
@@ -293,10 +270,10 @@ static void DSpRegisterGestaltVersion(void)
 			return;
 		}
 		const int16 rerr = (int16)CallMacOS3(DSpReplaceGestaltProc,
-		                                     replace_gestalt_tvect,
-		                                     kDSpGestaltSelector,
-		                                     dsp_gestalt_callback,
-		                                     dsp_gestalt_old_callback_slot);
+											 replace_gestalt_tvect,
+											 kDSpGestaltSelector,
+											 dsp_gestalt_callback,
+											 dsp_gestalt_old_callback_slot);
 		dsp_gestalt_registered = (rerr == 0);
 	}
 }
@@ -323,7 +300,7 @@ void DSpInit(void)
 	 *  DSpIsRegistered() probe works for DMC integration checks
 	 *  and for test isolation. Real gfxaccel_resources
 	 *  handler registration moves into DSpStartupHandler (below) so
-	 *  the refcount is the single source of truth for lifecycle —
+	 *  the refcount is the single source of truth for lifecycle -
 	 *  matching the DSp 1.7 API contract (Startup is where the
 	 *  subsystem actually initializes per resources/
 	 *  DrawSprocket1.7.pdf p.15).
@@ -356,27 +333,16 @@ void DSpInit(void)
 	 * the context table and applies the per-VBL fade interpolation. */
 	vbl_source_register_secondary_callback(DSpVBLGammaFadeCallback, NULL);
 
-	/* Register the VBL service callback —
+	/* Register the VBL service callback -
 	 * 4th VBL secondary callback slot. The callback body
 	 * atomic-increments s_dsp_vbl_count and runs the
 	 * per-context walk + PPC VBLProc invocation. */
 	vbl_source_register_secondary_callback(DSpVBLServiceCallback, NULL);
 
-	/* Register the DSp VBL
-	 * compositor publish callback — 5th and FINAL VBL secondary callback
-	 * (VBL_SECONDARY_CALLBACK_MAX raised 4 → 5 in vbl_source.h).
-	 * Fires AFTER DSpVBLServiceCallback so the GetVBLCount
-	 * atomic increment + user-VBLProc dispatch complete BEFORE we publish
-	 * — automatically preserves the "after user-VBLProc dispatch" ordering.
-	 * Slot use is now 5 of 5; future DSp work MUST deprecate an
-	 * existing callback before registering another. Registration is
-	 * idempotent via the DSpInit early-return guard. */
-	vbl_source_register_secondary_callback(DSpVBLCompositorPublishCallback, NULL);
-
 	/* Plug bg/fg hook bodies into the already-wired seam. Swift
 	 * BackgroundLifecycleObserver + gfxaccel_resources.mm C shim handle
 	 * the main-thread observer registration; DSp just plugs in flag-only
-	 * hooks — all real work happens on the emul thread via
+	 * hooks - all real work happens on the emul thread via
 	 * DSpVBLBackgroundForegroundDrain. */
 	gfxaccel_set_dsp_background_hook(DSpOnBackground, NULL);
 	gfxaccel_set_dsp_foreground_hook(DSpOnForeground, NULL);
@@ -390,7 +356,7 @@ int32_t DSpStartupHandler(void)
 	 *  Idempotent startup:
 	 *    First call registers the gfxaccel_resources handlers and
 	 *    bumps refcount to 1. Subsequent calls just bump the refcount
-	 *    and return kDSpNoErr without side effects — explicitly
+	 *    and return kDSpNoErr without side effects - explicitly
 	 *    permitted per DSp 1.7 API docs (resources/DrawSprocket1.7.pdf
 	 *    p.15: "Clients may call DSpStartup multiple times; the
 	 *    subsystem is reference-counted and a matching number of
@@ -405,6 +371,10 @@ int32_t DSpStartupHandler(void)
 		if (!dsp_registered) {
 			DSpInit();
 		}
+		/* Keep CFM loading out of the first SetState display transaction.
+		 * The resolved PPC routine is what makes the video-driver change and
+		 * QuickDraw GDevice reinitialization one guest-owned operation. */
+		DSpPrepareQuickDrawModeSwitch();
 		DSpRegisterResourceHandlers();
 		/* Mirror dsp_registered for the already-initialized path. A
 		 * post-Shutdown restart takes the DSpInit path above, which also
@@ -421,14 +391,14 @@ int32_t DSpShutdownHandler(void)
 	/*
 	 *  Clean Shutdown:
 	 *    Decrements the refcount. When the refcount reaches 0 the
-	 *    final matching Shutdown releases all DSp state —
+	 *    final matching Shutdown releases all DSp state -
 	 *    unregistering from gfxaccel_resources and
 	 *    flipping dsp_registered = false.
 	 *
 	 *  Safe on already-shutdown: calling Shutdown when
 	 *  dsp_startup_refcount == 0 returns kDSpNoErr without crashing
 	 *  and without re-invoking unregister. Matches DSp 1.7 semantics
-	 *  (double-shutdown is a common classic-Mac app pattern — atexit-
+	 *  (double-shutdown is a common classic-Mac app pattern - atexit-
 	 *  style handlers pair DSpShutdown unconditionally).
 	 */
 	if (dsp_startup_refcount == 0) {
@@ -437,6 +407,11 @@ int32_t DSpShutdownHandler(void)
 	}
 	dsp_startup_refcount--;
 	if (dsp_startup_refcount == 0) {
+		/* Some applications rely on DSpShutdown to dispose contexts they did
+		 * not explicitly release. Drive those contexts through the normal
+		 * inactive/release path while DSp is still registered, so Display
+		 * Manager restores MainDevice and the desktop CLUT transactionally. */
+		DSpShutdownContexts();
 		if (dsp_resource_handlers_registered) {
 			gfxaccel_resources_unregister_engine(kGfxEngineDSp);
 			dsp_resource_handlers_registered = false;
@@ -445,26 +420,21 @@ int32_t DSpShutdownHandler(void)
 		 * DSpInit's DSpBuildModesFromVModes call. Idempotent: an
 		 * already-empty cache is a no-op. */
 		DSpClearModes();
-		/* Unregister FIRST in reverse registration order — the publish shim
-		 * is the 5th/final callback registered. Idempotent: unregister is a
-		 * search-and-remove that does nothing when the callback isn't in the
-		 * table. */
-		vbl_source_unregister_secondary_callback(DSpVBLCompositorPublishCallback);
-		/* Unregister in reverse registration order — vbl-service is the 4th
-		 * callback registered (now second to remove after the publish shim).
+		/* Unregister in reverse registration order - vbl-service is the 4th
+		 * callback registered and therefore the first to remove.
 		 * Idempotent: unregister is a search-and-remove that does nothing when
 		 * the callback isn't in the table. */
 		vbl_source_unregister_secondary_callback(DSpVBLServiceCallback);
-		/* Unregister in REVERSE registration order — gamma-fade second (after
+		/* Unregister in REVERSE registration order - gamma-fade second (after
 		 * vbl-service), then clut-latch, then release. Idempotent: unregister
 		 * is a search-and-remove that does nothing when the callback isn't in
 		 * the table. */
 		vbl_source_unregister_secondary_callback(DSpVBLGammaFadeCallback);
-		/* Unregister in REVERSE registration order — clut-latch first, release
+		/* Unregister in REVERSE registration order - clut-latch first, release
 		 * second. Idempotent: unregister is a search-and-remove that does
 		 * nothing when the callback isn't in the table. */
 		vbl_source_unregister_secondary_callback(DSpVBLClutLatchCallback);
-		/* Symmetric with DSpInit — drop the VBL secondary callback so the
+		/* Symmetric with DSpInit - drop the VBL secondary callback so the
 		 * release FIFO isn't invoked after full teardown. Idempotent:
 		 * unregister is a search-and-remove that does nothing when the
 		 * callback isn't in the table. */
@@ -473,19 +443,18 @@ int32_t DSpShutdownHandler(void)
 			uint64_t reclaimed = gfxaccel_resources_heap_reset(kHeapEngineDSp);
 			if (reclaimed > 0) {
 				DSP_LOG("DSpShutdownHandler: DSp heap reset reclaimed %llu bytes",
-				        (unsigned long long)reclaimed);
+						(unsigned long long)reclaimed);
 			}
 		} else {
 			DSP_LOG("DSpShutdownHandler: DSp heap reset skipped; live allocations=%u",
-			        (unsigned)gfxaccel_resources_heap_live_allocation_count(kHeapEngineDSp));
+					(unsigned)gfxaccel_resources_heap_live_allocation_count(kHeapEngineDSp));
 		}
 		vbl_source_unregister_secondary_callback(DSpVBLReleaseCallback);
 		/* Symmetric clear of the bg/fg hook slots + reset the pending-flag
 		 * so a follow-up re-init doesn't re-drain stale state. */
 		gfxaccel_set_dsp_background_hook(NULL, NULL);
 		gfxaccel_set_dsp_foreground_hook(NULL, NULL);
-		atomic_store_explicit(&s_dsp_bg_fg_pending, 0u,
-		                      memory_order_relaxed);
+		s_dsp_bg_fg_pending.store(0u, std::memory_order_relaxed);
 		dsp_registered = false;
 		DSP_LOG("DSpShutdownHandler: final-call teardown complete");
 	}

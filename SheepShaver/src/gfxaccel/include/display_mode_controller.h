@@ -77,7 +77,8 @@ enum DMCOwner {
 	kDMCOwnerGL          = 2,  /* OpenGL 3D context active */
 	kDMCOwnerDSp         = 3,  /* reserved for M2 (DrawSprocket 1.7) */
 	kDMCOwnerBlanking    = 4,  /* solid-color blanking (fade / app-suspend) */
-	kDMCOwnerQuiescent   = 5   /* no display */
+	kDMCOwnerQuiescent   = 5,  /* no display */
+	kDMCOwnerGlide       = 6   /* 3dfx Glide 2.x / 3.x context active */
 };
 
 /*
@@ -96,7 +97,13 @@ enum DMCState {
 
 /*
  * Mode descriptor - input shape for dmc_create() and
- * dmc_request_mode_switch(). Validated
+ * dmc_request_mode_switch(). The controller records and broadcasts a mode
+ * transition; it does not allocate a framebuffer, change VModes/cur_mode, or
+ * reopen the platform video driver. Callers which require a real display
+ * change must use the video subsystem's canonical mode-switch entry point,
+ * which invokes this observer at the transition boundary.
+ *
+ * Validated
  * before any state mutation: depth in {1,2,4,8,16,32}, width/height in
  * (0, 4096], row_bytes > 0, pitch >= row_bytes. Validation failures return
  * kDMCErrInvalidModeDesc and leave controller state unchanged.
@@ -104,7 +111,7 @@ enum DMCState {
 struct DMCModeDesc {
 	uint32_t  width;            /* pixels, > 0, <= 4096 */
 	uint32_t  height;           /* pixels, > 0, <= 4096 */
-	uint32_t  depth;            /* VIDEO_DEPTH_* constant; one of {1,2,4,8,16,32} */
+	uint32_t  depth;            /* pixel bit count; one of {1,2,4,8,16,32} */
 	uint32_t  row_bytes;        /* per-row stride in bytes; > 0 */
 	uint32_t  pitch;            /* allocation stride (>= row_bytes) */
 	uint32_t  vbl_usec;         /* microseconds per VBL frame; 0 means "compute from objc_getFrameRateSetting" */
@@ -236,9 +243,34 @@ int32_t dmc_unsubscribe(const char *name);
 const struct DMCModeSnapshot *dmc_current_snapshot(void);
 
 /*
- * Request a mode switch to new_mode. Transitions T2 (from QuickDrawOwner)
- * or T6 (from ThreeDOwner). On success, the active_owner is preserved
- * across the switch: T6 from ThreeDOwner returns to ThreeDOwner.
+ * Prepare a real platform mode switch. This fires on_mode_exit while the
+ * outgoing framebuffer and graphics context are still valid, then leaves the
+ * controller in Transitioning state. The platform video driver must next
+ * replace its framebuffer/context and finish with dmc_request_mode_switch().
+ *
+ * The descriptor is used to validate and remember the requested geometry.
+ * Its screen pointers may be NULL because the replacement surface does not
+ * exist yet.
+ */
+int32_t dmc_prepare_mode_switch(const struct DMCModeDesc *new_mode);
+
+/*
+ * Cancel a prepared mode switch after the platform driver failed to replace
+ * its surface. Subscribers receive an advisory on_mode_enter for the outgoing
+ * mode so resources detached by prepare are restored.
+ */
+int32_t dmc_cancel_prepared_mode_switch(void);
+
+/*
+ * Commit and broadcast a mode switch to new_mode. This is the display-state
+ * observer used by the canonical video-driver transition, not a platform mode
+ * switch by itself. When preceded by dmc_prepare_mode_switch(), new_mode must
+ * describe the same requested geometry and must contain the framebuffer
+ * address actually installed by the driver. Legacy callers may still use this
+ * function as a single-phase observer.
+ *
+ * On success, the active_owner is preserved across the switch: T6 from
+ * ThreeDOwner returns to ThreeDOwner.
  *
  * THIS REVISION: transitions occur synchronously - the commit fires
  * immediately (no subscriber dispatch yet). A later revision adds the
@@ -253,9 +285,9 @@ const struct DMCModeSnapshot *dmc_current_snapshot(void);
 int32_t dmc_request_mode_switch(const struct DMCModeDesc *new_mode);
 
 /*
- * Set the active owner. Transitions T4 (QuickDrawOwner -> ThreeDOwner)
- * when owner is RAVE / GL / DSp; T5 (ThreeDOwner -> QuickDrawOwner)
- * when owner is QuickDraw.
+ * Set the active producer. This publishes active_owner atomically but does not
+ * fire mode-exit/mode-enter callbacks: changing which API most recently wrote
+ * the screen does not replace the screen surface or invalidate resources.
  *
  * The enum value is passed as uint32_t for C-linkage width safety across
  * the extern "C" boundary.
@@ -334,7 +366,7 @@ int32_t dmc_record_gamma_change_with_lut(const uint8_t *lut);
  * (DSpVBLGammaFadeCallback) calls this with fade_active=1 on each mid-fade
  * push and fade_active=0 on the final-frame push; a plain SetGamma stays on
  * the legacy 1-arg form (fade_active=0). The flag rides the EXISTING DMC
- * single-writer publish (s_write_mutex + atomic-release store) — ZERO new
+ * single-writer publish (s_write_mutex + atomic-release store) - ZERO new
  * concurrency primitives. lut semantics are identical to the 1-arg
  * form (NULL preserves the existing LUT; non-NULL overwrites 768 bytes).
  *
@@ -346,8 +378,8 @@ int32_t dmc_record_gamma_change_with_lut_fade(const uint8_t *lut, int fade_activ
 
 /*
  * Record a DRIVER (guest SetGamma) table. Always stores the 768-byte planar
- * table into driver_gamma_lut — the "original intensity" reference the DSp
- * fade paths blend toward — then applies it to the displayed gamma_lut only
+ * table into driver_gamma_lut - the "original intensity" reference the DSp
+ * fade paths blend toward - then applies it to the displayed gamma_lut only
  * when no fade is in progress. When fade_active is set on the current
  * snapshot the displayed LUT is left alone (the screen is faded/fading; an
  * immediate apply would visibly pop) and the pending fade's end-state
@@ -356,7 +388,7 @@ int32_t dmc_record_gamma_change_with_lut_fade(const uint8_t *lut, int fade_activ
  * Returns kDMCNoErr if the table was applied to the displayed LUT
  *         (caller should push it to the compositor as usual);
  *         kDMCDriverGammaDeferred if stored but NOT applied (fade in
- *         progress — caller must NOT push to the compositor);
+ *         progress - caller must NOT push to the compositor);
  *         kDMCErrNotInitialized if called before dmc_create();
  *         kDMCErrInvalidModeDesc if lut is NULL;
  *         kDMCErrOutOfMemory if snapshot allocation fails.
@@ -366,11 +398,11 @@ int32_t dmc_record_driver_gamma_change(const uint8_t *lut);
 /*
  * Assign the snapshot's blanking color WITHOUT
  * entering the Blanking FSM state. DSpSetBlankingColor (sub-op 760) only sets
- * the color the library uses the next time the screen is blanked — it does NOT
+ * the color the library uses the next time the screen is blanked - it does NOT
  * blank now (DSp 1.7 PDF p.30). No-state-transition twin of
  * dmc_record_gamma_change_with_lut: clone-mutate-publish the blanking_rgba
  * field under the EXISTING s_write_mutex (no NEW concurrency primitive); does
- * NOT call dmc_request_blanking (which would transition to Blanking — wrong
+ * NOT call dmc_request_blanking (which would transition to Blanking - wrong
  * for SetBlankingColor). rgba is 4 bytes (R, G, B, A).
  *
  * Returns kDMCNoErr on success;

@@ -23,10 +23,12 @@
 #include <stdio.h>
 #include <math.h>
 #include <time.h>
-#include <string.h>
-#ifdef __MINGW64__
+#if defined(__MINGW64__) || defined(_MSC_VER) || defined(__GLIBC__) || defined(__APPLE__)
 #include <fenv.h>
 #endif
+/* Set to 0 to drop the out-of-range address report in execute_loadstore. */
+#define PPC_REPORT_BAD_EA 0
+
 #include "cpu/vm.hpp"
 #include "cpu/ppc/ppc-cpu.hpp"
 #include "cpu/ppc/ppc-bitfields.hpp"
@@ -57,6 +59,8 @@
 
 #define DEBUG 0
 #include "debug.h"
+
+#include "gfx_log.h"
 
 /**
  *	Illegal & NOP instructions
@@ -95,7 +99,7 @@ void powerpc_cpu::execute_illegal(uint32 opcode)
 	}
 #endif
 
-	fprintf(stderr, "Illegal instruction at %08x, opcode = %08x\n", pc(), opcode);
+	gfx_log_emit("[crash] ", "Illegal instruction at %08x, opcode = %08x\n", pc(), opcode);
 
 #ifdef SHEEPSHAVER
 	// Dump the locked-'nift' monitor table on the first fault -- host-side
@@ -105,11 +109,11 @@ void powerpc_cpu::execute_illegal(uint32 opcode)
 #endif
 
 	// Backtrace: walk PPC stack frames to show call chain
-	fprintf(stderr, "  PPC Backtrace (stack frame walk):\n");
+	gfx_log_emit("[crash] ", "  PPC Backtrace (stack frame walk):\n");
 	{
 		uint32 sp = gpr(1);
 		uint32 ret_lr = lr();
-		fprintf(stderr, "    frame 0: PC=0x%08x LR=0x%08x SP=0x%08x\n", pc(), ret_lr, sp);
+		gfx_log_emit("[crash] ", "    frame 0: PC=0x%08x LR=0x%08x SP=0x%08x\n", pc(), ret_lr, sp);
 		for (int frame = 1; frame < 12 && sp != 0 && sp < 0x50000000; frame++) {
 			uint32 prev_sp = vm_read_memory_4(sp);  // backchain pointer
 			if (prev_sp == 0 || prev_sp <= sp || prev_sp >= 0x50000000) break;
@@ -117,35 +121,35 @@ void powerpc_cpu::execute_illegal(uint32 opcode)
 			uint32 call_instr = 0;
 			if (saved_lr >= 4 && saved_lr < 0x50000000)
 				call_instr = vm_read_memory_4(saved_lr - 4);
-			fprintf(stderr, "    frame %d: saved_LR=0x%08x SP=0x%08x call_instr=0x%08x\n",
+			gfx_log_emit("[crash] ", "    frame %d: saved_LR=0x%08x SP=0x%08x call_instr=0x%08x\n",
 					frame, saved_lr, prev_sp, call_instr);
 			sp = prev_sp;
 		}
 	}
 
 	// Dump PPC register state for crash analysis
-	fprintf(stderr, "  LR=0x%08x CTR=0x%08x CR=0x%08x XER=0x%08x\n",
+	gfx_log_emit("[crash] ", "  LR=0x%08x CTR=0x%08x CR=0x%08x XER=0x%08x\n",
 			lr(), ctr(), cr().get(), xer().get());
-	fprintf(stderr, "  R0=0x%08x R1(SP)=0x%08x R2(TOC)=0x%08x R3=0x%08x\n",
+	gfx_log_emit("[crash] ", "  R0=0x%08x R1(SP)=0x%08x R2(TOC)=0x%08x R3=0x%08x\n",
 			gpr(0), gpr(1), gpr(2), gpr(3));
-	fprintf(stderr, "  R4=0x%08x R5=0x%08x R6=0x%08x R7=0x%08x\n",
+	gfx_log_emit("[crash] ", "  R4=0x%08x R5=0x%08x R6=0x%08x R7=0x%08x\n",
 			gpr(4), gpr(5), gpr(6), gpr(7));
-	fprintf(stderr, "  R8=0x%08x R9=0x%08x R10=0x%08x R11=0x%08x\n",
+	gfx_log_emit("[crash] ", "  R8=0x%08x R9=0x%08x R10=0x%08x R11=0x%08x\n",
 			gpr(8), gpr(9), gpr(10), gpr(11));
-	fprintf(stderr, "  R12=0x%08x R13=0x%08x\n", gpr(12), gpr(13));
+	gfx_log_emit("[crash] ", "  R12=0x%08x R13=0x%08x\n", gpr(12), gpr(13));
 	// Dump instructions around the crash address
-	fprintf(stderr, "  Instructions around PC:\n");
+	gfx_log_emit("[crash] ", "  Instructions around PC:\n");
 	for (int di = -4; di <= 4; di++) {
 		uint32 addr = pc() + di * 4;
 		uint32 instr = vm_read_memory_4(addr);
-		fprintf(stderr, "    [0x%08x] %08x%s\n", addr, instr, di == 0 ? " <-- CRASH" : "");
+		gfx_log_emit("[crash] ", "    [0x%08x] %08x%s\n", addr, instr, di == 0 ? " <-- CRASH" : "");
 	}
 	// Dump a few words at LR to help understand call chain
-	fprintf(stderr, "  Instructions at LR 0x%08x:\n", lr());
+	gfx_log_emit("[crash] ", "  Instructions at LR 0x%08x:\n", lr());
 	for (int di = -2; di <= 2; di++) {
 		uint32 addr = lr() + di * 4;
 		uint32 instr = vm_read_memory_4(addr);
-		fprintf(stderr, "    [0x%08x] %08x\n", addr, instr);
+		gfx_log_emit("[crash] ", "    [0x%08x] %08x\n", addr, instr);
 	}
 
 	// Cross-TOC import calls reach here through a TVector held in r12
@@ -155,10 +159,10 @@ void powerpc_cpu::execute_illegal(uint32 opcode)
 	{
 		uint32 tv = gpr(12);
 		if (tv >= 0x1000 && tv < 0x50000000) {
-			fprintf(stderr, "  TVector neighborhood (r12=0x%08x):\n", tv);
+			gfx_log_emit("[crash] ", "  TVector neighborhood (r12=0x%08x):\n", tv);
 			for (int di = -2; di <= 5; di++) {
 				uint32 addr = tv + di * 4;
-				fprintf(stderr, "    [0x%08x] %08x%s\n", addr, vm_read_memory_4(addr),
+				gfx_log_emit("[crash] ", "    [0x%08x] %08x%s\n", addr, vm_read_memory_4(addr),
 						di == 0 ? " <-- code ptr" : (di == 1 ? " <-- TOC" : ""));
 			}
 		}
@@ -167,17 +171,17 @@ void powerpc_cpu::execute_illegal(uint32 opcode)
 			bool found = false;
 			for (int pages = 0; pages < 8192 && base >= 0x1000; pages++, base -= 0x1000) {
 				if (vm_read_memory_4(base) == 0x4a6f7921) {	// 'Joy!'
-					fprintf(stderr, "  PEF container candidate at 0x%08x (pc offset +0x%x):\n",
+					gfx_log_emit("[crash] ", "  PEF container candidate at 0x%08x (pc offset +0x%x):\n",
 							base, pc() - base);
 					for (int di = 0; di < 8; di++)
-						fprintf(stderr, "    [0x%08x] %08x\n", base + di * 4,
+						gfx_log_emit("[crash] ", "    [0x%08x] %08x\n", base + di * 4,
 								vm_read_memory_4(base + di * 4));
 					found = true;
 					break;
 				}
 			}
 			if (!found)
-				fprintf(stderr, "  no 'Joy!' PEF header within 32 MiB below pc\n");
+				gfx_log_emit("[crash] ", "  no 'Joy!' PEF header within 32 MiB below pc\n");
 		}
 	}
 
@@ -243,7 +247,7 @@ struct op_carry {
 template<>
 struct op_carry<op_add> {
 	static inline bool apply(uint32 a, uint32 b, uint32 c) {
-		// TODO: use 32-bit arithmetics
+		// TODO: use 32-bit arithmetic
 		uint64 carry = (uint64)a + (uint64)b + (uint64)c;
 		return (carry >> 32) != 0;
 	}
@@ -266,14 +270,14 @@ struct op_overflow<op_neg> {
 template<>
 struct op_overflow<op_add> {
 	static inline bool apply(uint32 a, uint32 b, uint32 c) {
-		// TODO: use 32-bit arithmetics
+		// TODO: use 32-bit arithmetic
 		int64 overflow = (int64)(int32)a + (int64)(int32)b + (int64)(int32)c;
 		return (((uint64)overflow) >> 63) ^ (((uint32)overflow) >> 31);
 	}
 };
 
 /**
- *	Perform an addition/substraction
+ *	Perform an addition/subtraction
  *
  *		RA		Input operand register, possibly 0
  *		RB		Input operand either register or immediate
@@ -605,7 +609,7 @@ void powerpc_cpu::record_fpscr(int exceptions)
 }
 
 /**
- *	Floating-point arithmetics
+ *	Floating-point arithmetic
  *
  *		FP		Floating Point type
  *		OP		Operation to perform
@@ -656,7 +660,7 @@ void powerpc_cpu::execute_fp_arith(uint32 opcode)
 		if (!FPSCR_VE_field::test(fpscr()))
 			fp_classify(d);
 	}
-	
+
 	// Set CR1 (FX, FEX, VX, VOX) if instruction has Rc set
 	if (Rc::test(opcode))
 		record_cr1();
@@ -704,12 +708,32 @@ void powerpc_cpu::execute_loadstore(uint32 opcode)
 	const uint32 b = RB::get(this, opcode);
 	const uint32 ea = a + b;
 
+#if PPC_REPORT_BAD_EA
+	/* The guest can only reach RAM and the frame buffer (top nibble 0, 1, 2),
+	   the ROM just above 0x40800000, SheepMem at 5 and the kernel area at 6.
+	   Flag the nibbles none of those use, plus the gap between the end of the
+	   ROM and SheepMem, which is where an address built out of text lands.
+	   Reporting here happens before the access faults, which is the only
+	   chance to record anything when the fault takes the process down. */
+	if (((0xff88u >> (ea >> 28)) & 1)
+			|| (ea >= 0x41000000u && ea < 0x50000000u)) {
+		extern void ppc_report_bad_ea(uint32 pc, uint32 ea, int is_load);
+		ppc_report_bad_ea(pc(), ea, LD);
+	}
+	/* The first 256 bytes of guest memory are the 68k exception vectors.
+	   The ROM fills them in during boot and nothing writes them afterwards,
+	   so name whoever stores there: a bad vector kills the next A-trap. */
+	if (!LD && ea < 0x100) {
+		extern void ppc_report_vector_store(uint32 pc, uint32 ea);
+		ppc_report_vector_store(pc(), ea);
+	}
+#endif
+
+
 	if (LD)
 		operand_RD::set(this, opcode, OP::apply(memory_helper<SZ, RX>::load(ea)));
-	else {
-		const uint32 store_value = operand_RS::get(this, opcode);
-		memory_helper<SZ, RX>::store(ea, store_value);
-	}
+	else
+		memory_helper<SZ, RX>::store(ea, operand_RS::get(this, opcode));
 
 	if (UP)
 		RA::set(this, opcode, ea);
@@ -739,10 +763,8 @@ void powerpc_cpu::execute_loadstore_multiple(uint32 opcode)
 	while (r <= 31) {
 		if (LD)
 			gpr(r) = vm_read_memory_4(ea);
-		else {
-			const uint32 store_value = gpr(r);
-			vm_write_memory_4(ea, store_value);
-		}
+		else
+			vm_write_memory_4(ea, gpr(r));
 		r++;
 		ea += 4;
 	}
@@ -779,10 +801,8 @@ void powerpc_cpu::execute_fp_loadstore(uint32 opcode)
 		v = operand_fp_dw_RS::get(this, opcode);
 		if (DB)
 			vm_write_memory_8(ea, v);
-		else {
-			const uint32 store_value = fp_store_single_convert(v);
-			vm_write_memory_4(ea, store_value);
-		}
+		else
+			vm_write_memory_4(ea, fp_store_single_convert(v));
 	}
 
 	if (UP)
@@ -791,6 +811,10 @@ void powerpc_cpu::execute_fp_loadstore(uint32 opcode)
 	increment_pc(4);
 }
 
+// Store Floating-Point as Integer Word Indexed (stfiwx): store the low 32 bits
+// of FPR(RS) to EA = (RA|0) + RB, with no conversion.  Not a template like the
+// other FP load/stores because it stores the raw low word, not a converted
+// single/double.
 void powerpc_cpu::execute_stfiwx(uint32 opcode)
 {
 	const uint32 a = operand_RA_or_0::get(this, opcode);
@@ -874,8 +898,7 @@ void powerpc_cpu::execute_store_string(uint32 opcode)
 	int rs = rS_field::extract(opcode);
 	int sh = 24;
 	for (int i = 0; i < nb; i++) {
-		const uint32 store_value = (gpr(rs) >> sh) & 0xff;
-		vm_write_memory_1(ea + i, store_value);
+		vm_write_memory_1(ea + i, gpr(rs) >> sh);
 		sh -= 8;
 		if (sh < 0) {
 			sh = 24;
@@ -912,17 +935,16 @@ void powerpc_cpu::execute_stwcx(uint32 opcode)
 	const uint32 ea = RA::get(this, opcode) + operand_RB::get(this, opcode);
 	cr().clear(0);
 	if (regs().reserve_valid) {
-			if (regs().reserve_addr == ea /* physical_addr(EA) */
+		if (regs().reserve_addr == ea /* physical_addr(EA) */
 #if KPX_MAX_CPUS != 1
-				/* HACK: if another processor wrote to the reserved block,
-				   nothing happens, i.e. we should operate as if reserve == 0 */
-				&& regs().reserve_data == vm_read_memory_4(ea)
+			/* HACK: if another processor wrote to the reserved block,
+			   nothing happens, i.e. we should operate as if reserve == 0 */
+			&& regs().reserve_data == vm_read_memory_4(ea)
 #endif
-				) {
-				const uint32 store_value = operand_RS::get(this, opcode);
-				vm_write_memory_4(ea, store_value);
-				cr().set(0, standalone_CR_EQ_field::mask());
-			}
+			) {
+			vm_write_memory_4(ea, operand_RS::get(this, opcode));
+			cr().set(0, standalone_CR_EQ_field::mask());
+		}
 		regs().reserve_valid = 0;
 	}
 	cr().set_so(0, xer().get_so());
@@ -1871,7 +1893,7 @@ void powerpc_cpu::execute_vector_sum(uint32 opcode)
 	typename VB::type const & vB = VB::const_ref(this, opcode);
 	typename VD::type & vD = VD::ref(this, opcode);
 	typename VD::element_type d;
-	
+
 	switch (SZ) {
 	case 1: // vsum
 		d = VB::get_element(vB, 3);

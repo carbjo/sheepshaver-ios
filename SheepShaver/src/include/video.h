@@ -81,6 +81,7 @@ inline uint32 TrivialBytesPerRow(uint32 width, int mode)
 }
 
 enum {	// viAppleID
+	APPLE_512x384 = 0x80,
 	APPLE_640x480 = 0x81,
 	APPLE_W_640x480,
 	APPLE_800x600,
@@ -91,7 +92,7 @@ enum {	// viAppleID
 	APPLE_1280x1024,
 	APPLE_1600x1200,
 	APPLE_CUSTOM,
-	APPLE_ID_MIN = APPLE_640x480,
+	APPLE_ID_MIN = APPLE_512x384,
 	APPLE_ID_MAX = APPLE_CUSTOM
 };
 
@@ -139,13 +140,45 @@ extern bool VideoInit(void);
 extern void VideoExit(void);
 extern void VideoVBL(void);
 extern void VideoInstallAccel(void);
+// Unwind guest-facing gfxaccel registration on a guest soft reboot so the
+// accRun/VideoInstallAccel retry path reinstalls into the fresh guest.
+extern void GfxAccelResetForReboot(void);
 extern void VideoQuitFullScreen(void);
 
 extern void video_set_palette(void);
 extern void video_set_gamma(int n_colors);
 extern void video_set_cursor(void);
 extern bool video_can_change_cursor(void);
+/*
+ * Soft-cursor participation at accelerated *screen publication* only
+ * (guest VRAM replace). Private RAVE/GL/DSp work surfaces need no handling.
+ * Callers wrap the onscreen write with begin/end (HideCursor/ShowCursor).
+ * Suspend around driver mode switches; resume after the new mode binds.
+ * No-ops when hardcursor is enabled.
+ */
+extern void video_screen_publish_cm_suspend(void);
+extern void video_screen_publish_cm_resume(void);
+extern void video_screen_publish_begin(int left, int top, int right, int bottom);
+extern void video_screen_publish_end(void);
 extern int16 video_mode_change(VidLocals *csSave, uint32 ParamPtr);
+extern bool video_prepare_guest_display(void);
+extern int video_find_guest_mode(uint32 width, uint32 height, uint32 depth);
+extern bool video_switch_guest_display(int mode_index);
+extern bool video_capture_guest_clut(uint8 out_clut[768],
+									 uint32 *out_depth);
+extern bool video_install_guest_clut(const uint8 clut_rgb[768],
+									 uint32 depth_bits,
+									 uint32 first,
+									 uint32 last);
+extern uint32 video_get_live_main_device_pixmap(void);
+extern uint32 video_create_guest_fullscreen_window(uint32 width, uint32 height);
+extern bool video_dispose_guest_window(uint32 window);
+// Return the guest framebuffer presentation viewport in drawable-pixel
+// coordinates (top-left origin). Aspect-fits the current guest mode into the
+// host drawable so mag_rate (including fractional values) scales the image to
+// the window the video driver opened.
+extern bool video_get_framebuffer_drawable_rect(int *out_x, int *out_y,
+												 int *out_w, int *out_h);
 extern void video_set_dirty_area(int x, int y, int w, int h);
 
 // DepthMode translation at the driver ABI (kDepthMode1 = 0x80 = lowest

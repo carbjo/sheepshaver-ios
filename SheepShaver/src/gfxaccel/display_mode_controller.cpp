@@ -18,9 +18,12 @@
  *  Subscriber dispatch:
  *    - dmc_subscribe stores a copy of the DMCSubscriber in a real
  *      std::vector<DMCSubscriber>, with name-keyed duplicate rejection.
- *    - Every legal transition fires on_mode_exit in REGISTRATION ORDER
- *      (FIFO) BEFORE the snapshot swap, then on_mode_enter in REVERSE
- *      REGISTRATION ORDER (LIFO) AFTER the swap. If any on_mode_enter
+ *    - Real display-mode replacement fires on_mode_exit in REGISTRATION
+ *      ORDER (FIFO) while the old platform surface is valid, then
+ *      on_mode_enter in REVERSE REGISTRATION ORDER (LIFO) after the new
+ *      surface is installed and published. Producer, palette, gamma and
+ *      blanking changes only publish a fresh immutable snapshot; they do not
+ *      invalidate mode resources. If any mode on_mode_enter
  *      returns non-zero, the controller fires exit for the rejected
  *      snapshot, republishes the outgoing snapshot, fires advisory enter
  *      for the restored snapshot, and returns kDMCErrSubscriberRejected.
@@ -63,16 +66,25 @@
 // Concurrency primitives
 #include <mutex>
 #include <atomic>
-#include <pthread.h>
 #include <cassert>
+#if defined(_WIN32)
+#include <windows.h>
+typedef uintptr_t dmc_thread_id_t;
+static inline dmc_thread_id_t dmc_thread_self(void) { return (dmc_thread_id_t)GetCurrentThreadId(); }
+#else
+#include <pthread.h>
+typedef pthread_t dmc_thread_id_t;
+static inline dmc_thread_id_t dmc_thread_self(void) { return pthread_self(); }
+#endif
 
 #define DEBUG 0
 #include "debug.h"
 
 // Internal logging macros - promote to DMC_ERR for the rollback path
 // so subscriber-rejected transitions are visible even in release builds.
+#include "gfx_log.h"
 #define DMC_LOG(fmt, ...) D(bug("[DMC] " fmt "\n", ##__VA_ARGS__))
-#define DMC_ERR(fmt, ...) do { printf("[DMC ERROR] " fmt "\n", ##__VA_ARGS__); } while (0)
+#define DMC_ERR(...) GFX_DEBUG_EMIT("[DMC ERROR] ", __VA_ARGS__)
 
 // ---------------------------------------------------------------------------
 // Module-local state (writer-mutex serialized; atomic snapshot
@@ -90,6 +102,16 @@ static std::atomic<const DMCModeSnapshot *>   s_current{NULL};
 static DMCState                               s_state = kDMCStateQuiescent;
 static uint32_t                               s_next_generation = 1;
 static bool                                   s_dmc_initialized = false;
+/* A platform mode switch is a two-phase transaction. prepare fires resource
+ * detach while the outgoing GL context is still alive; the video driver then
+ * replaces its surface/context; request_mode_switch commits the bound surface
+ * and reattaches resources. The current snapshot remains the outgoing stable
+ * snapshot between the two calls so lock-free readers never see half-bound
+ * geometry. */
+static bool                                   s_mode_switch_prepared = false;
+static DMCState                               s_mode_switch_source_state =
+												kDMCStateQuiescent;
+static DMCModeDesc                            s_mode_switch_requested = {};
 
 // Real subscriber registration table (dynamic vector). Ordered-vector
 // semantics: index 0 is first-registered, N-1 is last-registered. Exit
@@ -117,7 +139,7 @@ static thread_local bool                      s_in_dmc_call = false;
 // Thread-identity baseline (assertion gate). Captured on the first
 // dmc_create call; subsequent writes from any other thread trigger
 // assert(0).
-static pthread_t                              s_emul_thread = 0;
+static dmc_thread_id_t                        s_emul_thread = 0;
 
 // ---------------------------------------------------------------------------
 // Re-entry guard RAII helper.
@@ -152,9 +174,9 @@ struct DMCReentryScope {
 // ---------------------------------------------------------------------------
 #define DMC_ASSERT_EMUL_THREAD() \
 	do { \
-		if (s_emul_thread != 0 && pthread_self() != s_emul_thread) { \
+		if (s_emul_thread != 0 && dmc_thread_self() != s_emul_thread) { \
 			DMC_ERR("dmc_* called from non-emul thread (got %p, expected %p)", \
-			        (void *)pthread_self(), (void *)s_emul_thread); \
+					(void *)(uintptr_t)dmc_thread_self(), (void *)(uintptr_t)s_emul_thread); \
 			assert(0 && "DMC write from wrong thread"); \
 		} \
 	} while (0)
@@ -176,7 +198,7 @@ static int32_t dmc_validate_mode_desc(const DMCModeDesc *m) {
 		return kDMCErrInvalidModeDesc;
 	}
 	if (m->depth != 1 && m->depth != 2 && m->depth != 4 &&
-	    m->depth != 8 && m->depth != 16 && m->depth != 32) {
+		m->depth != 8 && m->depth != 16 && m->depth != 32) {
 		return kDMCErrInvalidModeDesc;
 	}
 	if (m->row_bytes == 0) {
@@ -186,6 +208,17 @@ static int32_t dmc_validate_mode_desc(const DMCModeDesc *m) {
 		return kDMCErrInvalidModeDesc;
 	}
 	return kDMCNoErr;
+}
+
+static bool dmc_same_mode_geometry(const DMCModeDesc *a,
+								   const DMCModeDesc *b)
+{
+	return a != NULL && b != NULL &&
+		a->width == b->width &&
+		a->height == b->height &&
+		a->depth == b->depth &&
+		a->row_bytes == b->row_bytes &&
+		a->pitch == b->pitch;
 }
 
 // Internal allocation wrappers that funnel the 4 direct calloc/malloc sites
@@ -200,20 +233,12 @@ static DMCModeSnapshot *dmc_alloc_raw_snapshot(void) {
 	return (DMCModeSnapshot *)malloc(sizeof(DMCModeSnapshot));
 }
 
-// Initialize gamma_lut[768] to the Mac Standard curve — the same default the
-// video driver installs at VideoOpen (set_gamma nil-table path) and the
-// profile table Mac OS pushes on Display Manager mode switches. Seeding the
-// pre-driver boot frames with the identical curve keeps the display policy's
-// composition (verbatim in OS-defined mode, inverse-cancelled to identity in
-// Linear mode) constant from the first frame onward.
+// Initialize gamma_lut[768] to the Mac-side identity ramp (input == output).
+// The compositor composes the display-space 1.8->2.2 policy when it uploads
+// this snapshot into its GPU-visible LUT.
 static void dmc_init_identity_gamma(DMCModeSnapshot *snap) {
-	for (int c = 0; c < 3; c++) {
-		for (int i = 0; i < 256; i++) {
-			const uint8_t v = GfxColorClassicMacToSRGBByte((uint8_t)i);
-			snap->gamma_lut[c * 256 + i]        = v;
-			snap->driver_gamma_lut[c * 256 + i] = v;
-		}
-	}
+	GfxColorFillIdentityGammaLUT(snap->gamma_lut);
+	GfxColorFillIdentityGammaLUT(snap->driver_gamma_lut);
 }
 
 // Heap-allocate a fresh snapshot populated from a DMCModeDesc. Fields the
@@ -226,9 +251,9 @@ static void dmc_init_identity_gamma(DMCModeSnapshot *snap) {
 // seeing the old snapshot for a sub-microsecond transition window during
 // which s_current still points at `outgoing`.
 static DMCModeSnapshot *dmc_alloc_snapshot_from_desc(const DMCModeDesc *m,
-                                                     uint32_t generation,
-                                                     uint32_t active_owner,
-                                                     const uint8_t blanking_rgba[4]) {
+													 uint32_t generation,
+													 uint32_t active_owner,
+													 const uint8_t blanking_rgba[4]) {
 	DMCModeSnapshot *s = dmc_alloc_zeroed_snapshot();
 	if (s == NULL) {
 		return NULL;
@@ -268,9 +293,9 @@ static DMCModeSnapshot *dmc_alloc_snapshot_from_desc(const DMCModeDesc *m,
 // dmc_end_blanking to produce a new snapshot without re-validating a
 // DMCModeDesc (the existing fields were validated on the previous commit).
 static DMCModeSnapshot *dmc_clone_snapshot_with_owner(const DMCModeSnapshot *src,
-                                                      uint32_t generation,
-                                                      uint32_t active_owner,
-                                                      const uint8_t blanking_rgba[4]) {
+													  uint32_t generation,
+													  uint32_t active_owner,
+													  const uint8_t blanking_rgba[4]) {
 	DMCModeSnapshot *s = dmc_alloc_zeroed_snapshot();
 	if (s == NULL) {
 		return NULL;
@@ -295,7 +320,8 @@ static DMCModeSnapshot *dmc_clone_snapshot_with_owner(const DMCModeSnapshot *src
 // Callers that pass Blanking / Quiescent owners must handle those cases
 // separately (they are not legal targets of dmc_set_active_owner).
 static DMCState dmc_target_state_for_owner(uint32_t owner) {
-	if (owner == kDMCOwnerRAVE || owner == kDMCOwnerGL || owner == kDMCOwnerDSp) {
+	if (owner == kDMCOwnerRAVE || owner == kDMCOwnerGL ||
+		owner == kDMCOwnerDSp || owner == kDMCOwnerGlide) {
 		return kDMCStateThreeDOwner;
 	}
 	return kDMCStateQuickDrawOwner;
@@ -346,7 +372,7 @@ static void dmc_internal_fire_exit_events(const DMCModeSnapshot *outgoing) {
 			int32_t r = s_subscribers[i].on_mode_exit(outgoing, s_subscribers[i].ctx);
 			if (r != kDMCNoErr) {
 				DMC_LOG("subscriber %s on_mode_exit returned %d (advisory; not vetoable)",
-				        s_subscribers[i].name != NULL ? s_subscribers[i].name : "?", (int)r);
+						s_subscribers[i].name != NULL ? s_subscribers[i].name : "?", (int)r);
 			}
 		}
 	}
@@ -360,14 +386,14 @@ static int32_t dmc_internal_fire_enter_events(const DMCModeSnapshot *incoming) {
 	// indices (filtered counter skipped NULL on_mode_enter). After: every
 	// dispatch_index reflects the subscriber's position in the registration
 	// table regardless of callback presence. Exit's `(uint32_t)i` stays
-	// untouched — both paths now converge on raw subscriber index.
+	// untouched - both paths now converge on raw subscriber index.
 	for (size_t i = s_subscribers.size(); i > 0; --i) {
 		size_t idx = i - 1;  // walk in reverse without size_t underflow
 		if (s_subscribers[idx].on_mode_enter != NULL) {
 			int32_t r = s_subscribers[idx].on_mode_enter(incoming, s_subscribers[idx].ctx);
 			if (r != kDMCNoErr) {
 				DMC_ERR("subscriber %s on_mode_enter returned %d - initiating rollback",
-				        s_subscribers[idx].name != NULL ? s_subscribers[idx].name : "?", (int)r);
+						s_subscribers[idx].name != NULL ? s_subscribers[idx].name : "?", (int)r);
 				return kDMCErrSubscriberRejected;
 			}
 		}
@@ -384,12 +410,12 @@ static void dmc_internal_fire_enter_events_advisory(
 		size_t idx = i - 1;
 		if (s_subscribers[idx].on_mode_enter != NULL) {
 			int32_t r = s_subscribers[idx].on_mode_enter(incoming,
-			                                             s_subscribers[idx].ctx);
+														 s_subscribers[idx].ctx);
 			if (r != kDMCNoErr) {
 				DMC_ERR("subscriber %s on_mode_enter returned %d during "
-				        "%s - rollback compensation continues",
-				        s_subscribers[idx].name != NULL ? s_subscribers[idx].name : "?",
-				        (int)r, reason != NULL ? reason : "rollback compensation");
+						"%s - rollback compensation continues",
+						s_subscribers[idx].name != NULL ? s_subscribers[idx].name : "?",
+						(int)r, reason != NULL ? reason : "rollback compensation");
 			}
 		}
 	}
@@ -443,14 +469,14 @@ int32_t dmc_create(const struct DMCModeDesc *initial_mode) {
 	}
 
 	if (s_emul_thread == 0) {
-		s_emul_thread = pthread_self();
+		s_emul_thread = dmc_thread_self();
 	}
 
 	const uint8_t default_blanking[4] = { 0x00, 0x00, 0x00, 0xFF };
 	DMCModeSnapshot *snap = dmc_alloc_snapshot_from_desc(initial_mode,
-	                                                     s_next_generation,
-	                                                     (uint32_t)kDMCOwnerQuickDraw,
-	                                                     default_blanking);
+														 s_next_generation,
+														 (uint32_t)kDMCOwnerQuickDraw,
+														 default_blanking);
 	if (snap == NULL) {
 		return kDMCErrOutOfMemory;  // uniform OOM return
 	}
@@ -469,7 +495,7 @@ int32_t dmc_create(const struct DMCModeDesc *initial_mode) {
 		// Rollback: undo T1. Since there is no prior snapshot, we tear
 		// back down to Quiescent.
 		dmc_internal_compensate_rejected_transition(
-		    snap, NULL, kDMCStateQuiescent, "dmc_create enter veto");
+			snap, NULL, kDMCStateQuiescent, "dmc_create enter veto");
 		free(snap);
 		s_dmc_initialized = false;
 		s_next_generation--;
@@ -500,6 +526,9 @@ int32_t dmc_shutdown(void) {
 	s_current.store(NULL, std::memory_order_release);
 	s_state = kDMCStateQuiescent;
 	s_dmc_initialized = false;
+	s_mode_switch_prepared = false;
+	s_mode_switch_source_state = kDMCStateQuiescent;
+	memset(&s_mode_switch_requested, 0, sizeof(s_mode_switch_requested));
 
 	// Free the outgoing snapshot AND the retirement ring (no readers
 	// remain after shutdown; production callers are quiescent during
@@ -536,7 +565,7 @@ int32_t dmc_subscribe(const struct DMCSubscriber *sub) {
 	// Duplicate-name check.
 	for (size_t i = 0; i < s_subscribers.size(); ++i) {
 		if (s_subscribers[i].name != NULL &&
-		    strcmp(s_subscribers[i].name, sub->name) == 0) {
+			strcmp(s_subscribers[i].name, sub->name) == 0) {
 			return kDMCErrSubscriberAlreadyRegistered;
 		}
 	}
@@ -573,7 +602,7 @@ int32_t dmc_unsubscribe(const char *name) {
 	}
 	for (size_t i = 0; i < s_subscribers.size(); ++i) {
 		if (s_subscribers[i].name != NULL &&
-		    strcmp(s_subscribers[i].name, name) == 0) {
+			strcmp(s_subscribers[i].name, name) == 0) {
 			s_subscribers.erase(s_subscribers.begin() + i);
 			return kDMCNoErr;
 		}
@@ -587,6 +616,67 @@ const struct DMCModeSnapshot *dmc_current_snapshot(void) {
 	return s_current.load(std::memory_order_acquire);
 }
 
+int32_t dmc_prepare_mode_switch(const struct DMCModeDesc *new_mode) {
+	DMCReentryScope reentry;
+	if (!reentry.installed) {
+		return kDMCErrReentrantRequest;
+	}
+	std::lock_guard<std::mutex> guard(s_write_mutex);
+	DMC_ASSERT_EMUL_THREAD();
+
+	if (!s_dmc_initialized) {
+		return kDMCErrNotInitialized;
+	}
+	if (s_state == kDMCStateTransitioning || s_mode_switch_prepared) {
+		return kDMCErrTransitionInProgress;
+	}
+	if (s_state == kDMCStateBlanking) {
+		return kDMCErrIllegalTransition;
+	}
+	int32_t verr = dmc_validate_mode_desc(new_mode);
+	if (verr != kDMCNoErr) {
+		return verr;
+	}
+
+	const DMCModeSnapshot *outgoing =
+		s_current.load(std::memory_order_relaxed);
+	s_mode_switch_source_state = s_state;
+	s_mode_switch_requested = *new_mode;
+	s_mode_switch_prepared = true;
+	s_state = kDMCStateTransitioning;
+
+	if (outgoing != NULL) {
+		dmc_internal_fire_exit_events(outgoing);
+	}
+	return kDMCNoErr;
+}
+
+int32_t dmc_cancel_prepared_mode_switch(void) {
+	DMCReentryScope reentry;
+	if (!reentry.installed) {
+		return kDMCErrReentrantRequest;
+	}
+	std::lock_guard<std::mutex> guard(s_write_mutex);
+	DMC_ASSERT_EMUL_THREAD();
+
+	if (!s_dmc_initialized) {
+		return kDMCErrNotInitialized;
+	}
+	if (!s_mode_switch_prepared ||
+		s_state != kDMCStateTransitioning) {
+		return kDMCErrIllegalTransition;
+	}
+
+	const DMCModeSnapshot *outgoing =
+		s_current.load(std::memory_order_relaxed);
+	s_state = s_mode_switch_source_state;
+	s_mode_switch_prepared = false;
+	memset(&s_mode_switch_requested, 0, sizeof(s_mode_switch_requested));
+	dmc_internal_fire_enter_events_advisory(
+		outgoing, "dmc_cancel_prepared_mode_switch");
+	return kDMCNoErr;
+}
+
 int32_t dmc_request_mode_switch(const struct DMCModeDesc *new_mode) {
 	DMCReentryScope reentry;
 	if (!reentry.installed) {
@@ -598,26 +688,44 @@ int32_t dmc_request_mode_switch(const struct DMCModeDesc *new_mode) {
 	if (!s_dmc_initialized) {
 		return kDMCErrNotInitialized;
 	}
-	if (s_state == kDMCStateTransitioning) {
+	const bool prepared = s_mode_switch_prepared &&
+		s_state == kDMCStateTransitioning;
+	if (s_state == kDMCStateTransitioning && !prepared) {
 		return kDMCErrTransitionInProgress;
 	}
 	if (s_state == kDMCStateBlanking) {
 		return kDMCErrIllegalTransition;
 	}
 	int32_t verr = dmc_validate_mode_desc(new_mode);
+	if (verr == kDMCNoErr && prepared &&
+		!dmc_same_mode_geometry(&s_mode_switch_requested, new_mode)) {
+		verr = kDMCErrInvalidModeDesc;
+	}
 	if (verr != kDMCNoErr) {
+		if (prepared) {
+			const DMCModeSnapshot *outgoing =
+				s_current.load(std::memory_order_relaxed);
+			s_state = s_mode_switch_source_state;
+			s_mode_switch_prepared = false;
+			memset(&s_mode_switch_requested, 0,
+				   sizeof(s_mode_switch_requested));
+			dmc_internal_fire_enter_events_advisory(
+				outgoing, "dmc_request_mode_switch invalid prepared commit");
+		}
 		return verr;
 	}
 
 	// Read current snapshot via relaxed (mutex is held; readers only see
 	// release-published values).
 	const DMCModeSnapshot *outgoing = s_current.load(std::memory_order_relaxed);
-	DMCState         src_state = s_state;
+	DMCState         src_state = prepared
+		? s_mode_switch_source_state : s_state;
 	uint32_t prior_owner = (outgoing != NULL) ? outgoing->active_owner : (uint32_t)kDMCOwnerQuickDraw;
 	uint32_t new_owner;
 	if (prior_owner == kDMCOwnerRAVE ||
-	    prior_owner == kDMCOwnerGL ||
-	    prior_owner == kDMCOwnerDSp) {
+		prior_owner == kDMCOwnerGL ||
+		prior_owner == kDMCOwnerDSp ||
+		prior_owner == kDMCOwnerGlide) {
 		new_owner = prior_owner;
 	} else {
 		new_owner = (uint32_t)kDMCOwnerQuickDraw;
@@ -625,7 +733,7 @@ int32_t dmc_request_mode_switch(const struct DMCModeDesc *new_mode) {
 	// Carry palette_gen / gamma_gen / fade_active / blanking_rgba across the switch.
 	uint32_t carry_palette_gen = (outgoing != NULL) ? outgoing->palette_gen : 0;
 	uint32_t carry_gamma_gen   = (outgoing != NULL) ? outgoing->gamma_gen   : 0;
-	// A mid-fade mode switch must NOT drop the fade flag — a
+	// A mid-fade mode switch must NOT drop the fade flag - a
 	// DSp game can FadeGammaOut across a resolution change.
 	uint32_t carry_fade_active = (outgoing != NULL) ? outgoing->fade_active : 0;
 	const uint8_t carry_blanking[4] = {
@@ -641,24 +749,31 @@ int32_t dmc_request_mode_switch(const struct DMCModeDesc *new_mode) {
 	// snapshot.transitioning sentinel should read s_state or simply accept
 	// a sub-microsecond window during which s_current still points at the
 	// stable `outgoing`.
-	s_state = kDMCStateTransitioning;
+	if (!prepared) {
+		s_state = kDMCStateTransitioning;
 
-	// Fire exit (FIFO) BEFORE publishing the new snapshot.
-	if (outgoing != NULL) {
-		dmc_internal_fire_exit_events(outgoing);
+		// Legacy single-phase observer: detach immediately before publishing.
+		// The canonical video driver uses prepare/commit so this callback runs
+		// while the old platform context is still alive.
+		if (outgoing != NULL) {
+			dmc_internal_fire_exit_events(outgoing);
+		}
 	}
 
 	// Build incoming snapshot.
 	DMCModeSnapshot *incoming = dmc_alloc_snapshot_from_desc(new_mode,
-	                                                         s_next_generation,
-	                                                         new_owner,
-	                                                         carry_blanking);
+															 s_next_generation,
+															 new_owner,
+															 carry_blanking);
 	if (incoming == NULL) {
 		// Allocation failure - roll back to prior stable state. No enter
 		// has fired yet, but exits already ran and must be compensated.
 		s_state = src_state;
+		s_mode_switch_prepared = false;
+		memset(&s_mode_switch_requested, 0,
+			   sizeof(s_mode_switch_requested));
 		dmc_internal_fire_enter_events_advisory(
-		    outgoing, "dmc_request_mode_switch allocation rollback");
+			outgoing, "dmc_request_mode_switch allocation rollback");
 		return kDMCErrOutOfMemory;
 	}
 	incoming->palette_gen = carry_palette_gen;
@@ -676,6 +791,8 @@ int32_t dmc_request_mode_switch(const struct DMCModeDesc *new_mode) {
 	s_current.store(incoming, std::memory_order_release);
 	DMCState target = dmc_target_state_for_owner(new_owner);
 	s_state = target;
+	s_mode_switch_prepared = false;
+	memset(&s_mode_switch_requested, 0, sizeof(s_mode_switch_requested));
 
 	// Fire enter (LIFO) AFTER publication.
 	int32_t enter_err = dmc_internal_fire_enter_events(incoming);
@@ -683,15 +800,15 @@ int32_t dmc_request_mode_switch(const struct DMCModeDesc *new_mode) {
 		// Rollback: compensate subscribers, re-publish outgoing, and
 		// retire the rejected incoming.
 		dmc_internal_compensate_rejected_transition(
-		    incoming, outgoing, src_state,
-		    "dmc_request_mode_switch enter veto");
+			incoming, outgoing, src_state,
+			"dmc_request_mode_switch enter veto");
 		// Route the rejected snapshot through
 		// the retirement ring so concurrent readers get one more publish of
 		// grace before it is freed. incoming->generation + 1 is the ring slot
 		// the NEXT successful publish would have used; concurrent readers
 		// holding `incoming` finish their frame before this slot is
 		// overwritten (at gen + 3 publish). The rejected generation stays
-		// consumed — we do NOT decrement s_next_generation because
+		// consumed - we do NOT decrement s_next_generation because
 		// the ring-slot calculation relies on the bumped counter.
 		dmc_retire_snapshot(incoming, incoming->generation + 1);
 		return kDMCErrSubscriberRejected;
@@ -713,15 +830,14 @@ int32_t dmc_set_active_owner(uint32_t owner) {
 	if (!s_dmc_initialized) {
 		return kDMCErrNotInitialized;
 	}
-	// Out-of-enum-range check. kDMCOwnerQuiescent (5) is the maximum legal
-	// enum value; anything above that is invalid. Using set_active_owner to
-	// request Blanking or Quiescent is also illegal (those are reached via
-	// dmc_request_blanking / dmc_shutdown respectively).
-	if (owner > (uint32_t)kDMCOwnerQuiescent) {
+	// Out-of-enum-range check. kDMCOwnerGlide is the highest legal owner
+	// that set_active_owner may request. Blanking / Quiescent are reached
+	// only via dmc_request_blanking / dmc_shutdown.
+	if (owner > (uint32_t)kDMCOwnerGlide) {
 		return kDMCErrInvalidOwner;
 	}
 	if (owner == (uint32_t)kDMCOwnerBlanking ||
-	    owner == (uint32_t)kDMCOwnerQuiescent) {
+		owner == (uint32_t)kDMCOwnerQuiescent) {
 		return kDMCErrInvalidOwner;
 	}
 	if (s_state == kDMCStateBlanking) {
@@ -736,30 +852,18 @@ int32_t dmc_set_active_owner(uint32_t owner) {
 	// owner + the current FSM state already match. Once engines
 	// start vending overlays per frame (which drives a dmc_set_active_owner call
 	// per frame), this prevents 60 Hz calloc + subscriber-dispatch churn. Both
-	// owner AND state must match — a state transition (e.g. back from Blanking)
+	// owner AND state must match - a state transition (e.g. back from Blanking)
 	// still requires a real transition.
 	if (outgoing != NULL &&
-	    outgoing->active_owner == owner &&
-	    s_state == dmc_target_state_for_owner(owner)) {
+		outgoing->active_owner == owner &&
+		s_state == dmc_target_state_for_owner(owner)) {
 		return kDMCNoErr;
 	}
-	DMCState         src_state = s_state;
-
-	s_state = kDMCStateTransitioning;
-	if (outgoing != NULL) {
-		dmc_internal_fire_exit_events(outgoing);
-	}
-
 	DMCModeSnapshot *incoming = dmc_clone_snapshot_with_owner(outgoing,
-	                                                          s_next_generation,
-	                                                          owner,
-	                                                          NULL);
+															  s_next_generation,
+															  owner,
+															  NULL);
 	if (incoming == NULL) {
-		// Uniform kDMCErrOutOfMemory on alloc failure; exits already
-		// ran and must be compensated.
-		s_state = src_state;
-		dmc_internal_fire_enter_events_advisory(
-		    outgoing, "dmc_set_active_owner allocation rollback");
 		return kDMCErrOutOfMemory;
 	}
 	s_next_generation++;
@@ -767,18 +871,10 @@ int32_t dmc_set_active_owner(uint32_t owner) {
 	DMCState target = dmc_target_state_for_owner(owner);
 	s_state = target;
 
-	int32_t enter_err = dmc_internal_fire_enter_events(incoming);
-	if (enter_err != kDMCNoErr) {
-		dmc_internal_compensate_rejected_transition(
-		    incoming, outgoing, src_state,
-		    "dmc_set_active_owner enter veto");
-		// Route the rejected snapshot through
-		// the retirement ring. See dmc_request_mode_switch rollback site for
-		// the uniform-across-4-sites rationale.
-		dmc_retire_snapshot(incoming, incoming->generation + 1);
-		return kDMCErrSubscriberRejected;
-	}
-
+	/* active_owner identifies the most recent screen producer, not a resource
+	 * lifetime. No display surface or GL/Metal context changed here, so firing
+	 * mode callbacks would destroy the texture the producer is about to
+	 * submit and then re-vend an unrelated replacement under the same frame. */
 	dmc_retire_snapshot(outgoing, incoming->generation);
 	return kDMCNoErr;
 }
@@ -802,41 +898,20 @@ int32_t dmc_request_blanking(const uint8_t rgba[4]) {
 	}
 
 	const DMCModeSnapshot *outgoing = s_current.load(std::memory_order_relaxed);
-	DMCState         src_state = s_state;
-
-	s_state = kDMCStateTransitioning;
-	if (outgoing != NULL) {
-		dmc_internal_fire_exit_events(outgoing);
-	}
 
 	DMCModeSnapshot *incoming = dmc_clone_snapshot_with_owner(outgoing,
-	                                                          s_next_generation,
-	                                                          (uint32_t)kDMCOwnerBlanking,
-	                                                          rgba);
+															  s_next_generation,
+															  (uint32_t)kDMCOwnerBlanking,
+															  rgba);
 	if (incoming == NULL) {
-		// Uniform kDMCErrOutOfMemory on alloc failure; exits already
-		// ran and must be compensated.
-		s_state = src_state;
-		dmc_internal_fire_enter_events_advisory(
-		    outgoing, "dmc_request_blanking allocation rollback");
 		return kDMCErrOutOfMemory;
 	}
 	s_next_generation++;
 	s_current.store(incoming, std::memory_order_release);
 	s_state = kDMCStateBlanking;
 
-	int32_t enter_err = dmc_internal_fire_enter_events(incoming);
-	if (enter_err != kDMCNoErr) {
-		dmc_internal_compensate_rejected_transition(
-		    incoming, outgoing, src_state,
-		    "dmc_request_blanking enter veto");
-		// Route the rejected snapshot through
-		// the retirement ring. See dmc_request_mode_switch rollback site for
-		// the uniform-across-4-sites rationale.
-		dmc_retire_snapshot(incoming, incoming->generation + 1);
-		return kDMCErrSubscriberRejected;
-	}
-
+	/* Blanking changes visible policy, not framebuffer identity. Preserve all
+	 * engine allocations so a fade cannot invalidate the frame it is fading. */
 	dmc_retire_snapshot(outgoing, incoming->generation);
 	return kDMCNoErr;
 }
@@ -857,40 +932,17 @@ int32_t dmc_end_blanking(void) {
 	}
 
 	const DMCModeSnapshot *outgoing = s_current.load(std::memory_order_relaxed);
-	DMCState         src_state = s_state;
-
-	s_state = kDMCStateTransitioning;
-	if (outgoing != NULL) {
-		dmc_internal_fire_exit_events(outgoing);
-	}
 
 	DMCModeSnapshot *incoming = dmc_clone_snapshot_with_owner(outgoing,
-	                                                          s_next_generation,
-	                                                          (uint32_t)kDMCOwnerQuickDraw,
-	                                                          NULL);
+															  s_next_generation,
+															  (uint32_t)kDMCOwnerQuickDraw,
+															  NULL);
 	if (incoming == NULL) {
-		// Uniform kDMCErrOutOfMemory on alloc failure; exits already
-		// ran and must be compensated.
-		s_state = src_state;
-		dmc_internal_fire_enter_events_advisory(
-		    outgoing, "dmc_end_blanking allocation rollback");
 		return kDMCErrOutOfMemory;
 	}
 	s_next_generation++;
 	s_current.store(incoming, std::memory_order_release);
 	s_state = kDMCStateQuickDrawOwner;
-
-	int32_t enter_err = dmc_internal_fire_enter_events(incoming);
-	if (enter_err != kDMCNoErr) {
-		dmc_internal_compensate_rejected_transition(
-		    incoming, outgoing, src_state,
-		    "dmc_end_blanking enter veto");
-		// Route the rejected snapshot through
-		// the retirement ring. See dmc_request_mode_switch rollback site for
-		// the uniform-across-4-sites rationale.
-		dmc_retire_snapshot(incoming, incoming->generation + 1);
-		return kDMCErrSubscriberRejected;
-	}
 
 	dmc_retire_snapshot(outgoing, incoming->generation);
 	return kDMCNoErr;
@@ -937,7 +989,7 @@ int32_t dmc_record_palette_change(void) {
 // Companion to
 // dmc_record_gamma_change_with_lut that ALSO publishes a fade_active flag in
 // the SAME snapshot bump. Clone-mutate-publish under the EXISTING s_write_mutex
-// (no NEW MTLFence / MTLSharedEvent / std::mutex / @synchronized / _Atomic — the
+// (no NEW MTLFence / MTLSharedEvent / std::mutex / @synchronized / _Atomic - the
 // flag rides the existing atomic-release publish). Publishing fade_active
 // and the interpolated LUT together avoids a frame where the LUT is mid-fade
 // but the flag is stale, which would warp one fade frame: a separate
@@ -989,7 +1041,7 @@ int32_t dmc_record_gamma_change_with_lut(const uint8_t *lut) {
 }
 
 // Record a DRIVER (guest SetGamma) table: always store it in
-// driver_gamma_lut — the "original intensity" the DSp fades blend toward —
+// driver_gamma_lut - the "original intensity" the DSp fades blend toward -
 // and apply it to the displayed gamma_lut only when no fade is in progress.
 // During a fade the displayed LUT is left alone (an immediate apply would
 // visibly pop the faded screen); the fade's end-state push delivers the
@@ -1040,19 +1092,19 @@ int32_t dmc_record_gamma_change(void) {
 
 // Assign the snapshot's blanking color WITHOUT
 // entering the Blanking FSM state. DSpSetBlankingColor (sub-op 760) only sets
-// the color the library will use the next time the screen IS blanked — it does
+// the color the library will use the next time the screen IS blanked - it does
 // NOT blank now (DSp 1.7 PDF p.30). This is the no-state-transition twin of
 // dmc_record_gamma_change_with_lut: clone the current snapshot, mutate the one
 // field (blanking_rgba), bump generation, publish, retire old. It deliberately
 // does NOT call any blanking-enter path (dmc_request_blanking transitions the
-// FSM to Blanking — wrong for SetBlankingColor).
+// FSM to Blanking - wrong for SetBlankingColor).
 //
 // Reuses the EXISTING DMC single-writer primitive (s_write_mutex +
 // DMCReentryScope + DMC_ASSERT_EMUL_THREAD); adds ZERO new MTLFence /
 // MTLSharedEvent / std::mutex / @synchronized / _Atomic. The DMC is the
 // documented single-writer exception, so this is compliant.
 //
-// No subscriber events are fired — this is a pure snapshot field update, not an
+// No subscriber events are fired - this is a pure snapshot field update, not an
 // FSM transition (same posture as dmc_record_palette_change / gamma_change).
 int32_t dmc_set_blanking_color(const uint8_t rgba[4]) {
 	DMCReentryScope reentry;

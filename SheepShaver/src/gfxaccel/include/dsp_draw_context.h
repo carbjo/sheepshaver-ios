@@ -150,12 +150,28 @@ extern uint32_t DSpGetContextEnumerationIndex(uint32_t ctxRef);
 extern int32_t  DSpContext_ReserveHandler(uint32_t ctxRef,
                                           uint32_t attrAddr);
 extern int32_t  DSpContext_ReleaseHandler(uint32_t ctxRef);
+/* Final DSpShutdown cleanup: deactivate and release every live context through
+ * the ordinary public lifecycle so the guest Display Manager restores the
+ * desktop mode and indexed ColorTable before the engine unregisters. */
+extern void     DSpShutdownContexts(void);
 extern int32_t  DSpContext_GetBackBufferHandler(uint32_t ctxRef,
                                                 uint32_t options,
                                                 uint32_t outBufAddr);
 extern int32_t  DSpContext_SwapBuffersHandler(uint32_t ctxRef,
                                               uint32_t busyProcAddr,
                                               uint32_t userRefCon);
+
+/* Resolve the guest Display Manager mode-switch entry point while DSp starts,
+ * before a SetState transaction owns the display. Safe to call repeatedly. */
+extern void     DSpPrepareQuickDrawModeSwitch(void);
+/* Return the live QuickDraw MainDevice PixMap record, or zero if the guest
+ * device list is not initialized. Callers copy metadata; they never mutate it. */
+extern uint32_t DSpGetLiveMainDevicePixMap(void);
+/* Publish the current DSp back buffer into the video driver's canonical guest
+ * framebuffer. Matching formats are copied; mixed back/display depths are
+ * converted directly into the live screen format. */
+extern bool     DSpCopyBackBufferToCanonicalScreen(
+	struct DSpContextPrivate *ctx);
 extern int32_t  DSpContext_SetStateHandler(uint32_t ctxRef, uint32_t state);
 extern int32_t  DSpContext_GetStateHandler(uint32_t ctxRef,
                                            uint32_t outStateAddr);
@@ -363,8 +379,10 @@ extern void     DSpContext_SetStateSwitchHandoff(uint32_t oldCtxRef);
  *
  *  The DSp 1.7 pp.56-57 wire-format —
  *  8-byte ColorSpec / 16-bit big-endian channels, pointer-before-index arg
- *  order (entriesAddr, inStartingEntry, inEntryCount); inEntryCount is a
- *  COUNT, not an inclusive last index. The 16<->8 conversion is confined
+ *  order (entriesAddr, inStartingEntry, inEntryCount); inEntryCount is an
+ *  INCLUSIVE LAST INDEX, not a count - DrawSprocket follows the classic
+ *  Color Manager / SetEntries convention, so a full 256-entry load is
+ *  start=0, inEntryCount=255. The 16<->8 conversion is confined
  *  to the guest-RAM boundary; internal clut_bytes storage stays 8-bit.
  */
 extern int32_t  DSpContext_SetCLUTEntriesHandler(uint32_t ctxRef,

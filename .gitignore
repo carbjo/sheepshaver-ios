@@ -37,4 +37,10 @@ project.xcworkspace/
 # JetBrains IDE settings
 #
 *.idea
-SheepShaver/src/MacOSX/Launcher/English.lproj/VMSettingsWindow.nib/designable.nib
+.vs
+/out
+/build-x86
+/build-debug
+/build
+/PocketShaver-master
+/third_party

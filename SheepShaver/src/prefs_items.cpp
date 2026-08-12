@@ -43,8 +43,9 @@ prefs_desc common_prefs_items[] = {
 	{"screen", TYPE_STRING, false,      "video mode"},
 	{"windowmodes", TYPE_INT32, false,  "bitmap of allowed window video modes"},
 	{"screenmodes", TYPE_INT32, false,  "bitmap of allowed fullscreen video modes"},
-	{"seriala", TYPE_STRING, false,     "device name of Mac serial port A"},
-	{"serialb", TYPE_STRING, false,     "device name of Mac serial port B"},
+	{"seriala", TYPE_STRING, false,     "device name of Mac serial port A, or midi to play through the synthesiser"},
+	{"serialb", TYPE_STRING, false,     "device name of Mac serial port B, or midi to play through the synthesiser"},
+	{"debugserial", TYPE_INT32, false,  "serial port logging level, 0 for none"},
 	{"rom", TYPE_STRING, false,         "path of ROM file"},
 	{"bootdrive", TYPE_INT32, false,    "boot drive number"},
 	{"bootdriver", TYPE_INT32, false,   "boot driver number"},
@@ -52,6 +53,7 @@ prefs_desc common_prefs_items[] = {
 	{"frameskip", TYPE_INT32, false,    "number of frames to skip in refreshed video modes"},
 	{"gfxaccel", TYPE_BOOLEAN, false,   "turn on QuickDraw acceleration"},
 	{"nocdrom", TYPE_BOOLEAN, false,    "don't install CD-ROM driver"},
+	{"nojoystick", TYPE_BOOLEAN, false, "don't install Joy Manager driver"},
 	{"nonet", TYPE_BOOLEAN, false,      "don't use Ethernet"},
 	{"nosound", TYPE_BOOLEAN, false,    "don't enable sound output"},
 	{"nogui", TYPE_BOOLEAN, false,      "disable GUI"},
@@ -74,6 +76,7 @@ prefs_desc common_prefs_items[] = {
 	{"raveaccel", TYPE_BOOLEAN, false,	"enable RAVE 3D acceleration"},
 	{"glaccel", TYPE_BOOLEAN, false,	"enable OpenGL acceleration"},
 	{"dspaccel", TYPE_BOOLEAN, true,	"enable DrawSprocket (DSp) acceleration"},
+	{"glideaccel", TYPE_BOOLEAN, false,	"enable 3dfx Glide 2/3 acceleration"},
 	{"swap_opt_cmd", TYPE_BOOLEAN, false,	"swap option and command key"},
 	{"host_domain", TYPE_STRING, true,	"handle DNS requests for this domain on the host (slirp only)"},
 	{"redir", TYPE_STRING, true,		"port forwarding for slirp"},
@@ -119,11 +122,13 @@ void AddPrefsDefaults(void)
 	PrefsAddInt32("frameskip", 8);
 #endif
 	PrefsAddBool("gfxaccel", true);
-	PrefsAddBool("nqdaccel", false);
-	PrefsAddBool("raveaccel", false);
-	PrefsAddBool("glaccel", false);
-	PrefsAddBool("dspaccel", false);
+	PrefsAddBool("nqdaccel",true);
+	PrefsAddBool("raveaccel",true);
+	PrefsAddBool("glaccel",true);
+	PrefsAddBool("dspaccel",true);
+	PrefsAddBool("glideaccel",true);
 	PrefsAddBool("nocdrom", false);
+	PrefsAddBool("nojoystick", false);
 	PrefsAddBool("nonet", false);
 	PrefsAddBool("nosound", false);
 	PrefsAddBool("nogui", false);
@@ -136,7 +141,7 @@ void AddPrefsDefaults(void)
 	PrefsAddBool("jit", true);
 #else
 	// No JIT on this host, or (arm64) the C++ core keeps this pref off as the
-	// interpreter baseline — enabling PPC_ENABLE_JIT must not self-activate it.
+	// interpreter baseline - enabling PPC_ENABLE_JIT must not self-activate it.
 	// The Mac Catalyst app defaults JIT on at the settings layer (see
 	// MiscellaneousSettings) and writes "jit" true when the user boots.
 	PrefsAddBool("jit", false);

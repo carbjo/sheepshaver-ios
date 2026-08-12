@@ -99,7 +99,7 @@ uint64_t vbl_source_get_tick_count(void);
 
 /*
  * Returns non-zero if CAMetalDisplayLink is active (iOS 17+).
- * When true, callers must NOT call [layer nextDrawable] — drawables
+ * When true, callers must NOT call [layer nextDrawable] - drawables
  * are delivered via the VBL callback instead.
  */
 int      vbl_source_uses_metal_display_link(void);
@@ -146,11 +146,11 @@ void     vbl_source_signal_3d_pacing(void);
 /* --- Secondary-callback fan-out --- */
 
 /*
- * Register a secondary VBL callback — fires AFTER the primary callback
+ * Register a secondary VBL callback - fires AFTER the primary callback
  * inside the same main-thread tick. The DSp release-queue drain uses
  * this; the background/foreground drain chains off the same hook.
  * Alternative "hook DSp drain from inside the compositor VBL callback"
- * REJECTED — violates the compositor-blindness invariant
+ * REJECTED - violates the compositor-blindness invariant
  * (metal_compositor cannot know about DSp).
  *
  * Returns 0 on success; kGfxAccelErrVBLAlreadyRunning if the table is
@@ -158,7 +158,7 @@ void     vbl_source_signal_3d_pacing(void);
  * one-shot at DSpInit time before any VBL tick fires, so no cross-thread
  * race is possible under the single-writer model.
  */
-#define VBL_SECONDARY_CALLBACK_MAX 5   /* adds DSpVBLCompositorPublishCallback as the 5th slot. */
+#define VBL_SECONDARY_CALLBACK_MAX 4
 int32_t vbl_source_register_secondary_callback(VBLSourceCallbackFn cb,
                                                 void *ctx);
 void    vbl_source_unregister_secondary_callback(VBLSourceCallbackFn cb);

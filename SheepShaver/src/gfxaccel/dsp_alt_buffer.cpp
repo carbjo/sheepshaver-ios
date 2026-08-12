@@ -16,8 +16,6 @@
  *  DSpResetAltBufferTable) is declared in dsp_alt_buffer.h. The record struct +
  *  DSP_MAX_ALT_BUFFERS live in dsp_alt_buffer.h.
  */
-#import <Metal/Metal.h>
-
 #include "sysdeps.h"
 #include "cpu_emulation.h"
 #include "thunks.h"                /* SheepMem::Reserve (test hook) */
@@ -31,18 +29,14 @@
 #include "dsp_display_id_policy.h"
 #include "dsp_display_mode_policy.h"
 #include "dsp_front_buffer_policy.h"
-#include "dsp_front_staging_seed_policy.h"
 #include "dsp_get_attributes_policy.h"
 #include "dsp_guest_address.h"
-#include "dsp_main_device_redirect_policy.h"
-#include "dsp_quickdraw_restore_policy.h"
-#include "dsp_vbl_publish_policy.h"
 #include "dsp_pixmap_offsets.h"    /* PixMap field offsets + LMADDR_MAIN_DEVICE / GDEVICE_OFF_PMAP */
-#include "dsp_metal_renderer.h"    /* DSpAllocateBackBuffer / DSpEncodeBackBufferBlit / DSpGetBackBufferCGrafPtr */
+#include "dsp_metal_renderer.h"    /* shared DSp buffer allocation/backing access */
 #include "gfxaccel_resources.h"    /* per-buffer owner-tag API */
 #include "gfxaccel_resources_heap.h" /* kHeapEngineDSp + heap_alloc_buffer for AltBuffer backing */
 #include "nqd_accel.h"               /* NQDMetalBitblt1to1 / NQDMetalBitbltScaled / NQDMetalFlush for DSpBlit */
-#include "metal_compositor.h"      /* MetalCompositorSubmitFrame + MetalCompositorGetFramebufferTexture + CompositeLayer */
+#include "metal_compositor.h"      /* canonical screen query and pacing */
 #include "metal_device_shared.h"   /* SharedMetalCommandQueue (SwapBuffers blit path) */
 #include "display_mode_controller.h" /* dmc_current_snapshot (FrameDescriptor generation); DMCOwner enum + dmc_set_active_owner */
 #include "dsp_engine_internal.h"   /* DSpMapStateToDMCOwnerTyped (internal-only, NOT in include/) */
@@ -61,32 +55,32 @@ static void DSpResetHeapIfIdleAfterAltBufferRelease(const char *reason)
 	uint64_t reclaimed = gfxaccel_resources_heap_reset(kHeapEngineDSp);
 	if (reclaimed > 0) {
 		DSP_LOG("DSp heap reset after %s reclaimed %llu bytes",
-		        reason ? reason : "alt-buffer release",
-		        (unsigned long long)reclaimed);
+				reason ? reason : "alt-buffer release",
+				(unsigned long long)reclaimed);
 	}
 }
 
 /* Zero a record's fields WITHOUT memset (DSpAltBufferRecord holds ARC
- * id<MTLBuffer>/id<MTLTexture> fields — memset over them bypasses ARC and is
- * undefined, -Wnontrivial-memcall). ObjC fields are assigned nil (ARC
+ * id<MTLBuffer>/id<MTLTexture> fields - memset over them bypasses ARC and is
+ * undefined, -Wnontrivial-memcall). ObjC fields are assigned NULL (ARC
  * releases); POD fields are explicitly reset. */
 static void DSpClearAltBufferRecord(DSpAltBufferRecord *rec)
 {
 	/* Release the guest-RAM pixel-staging buffer that backed the CGrafPort
 	 * (if any). It was exposed to the guest as a PixMap baseAddr, so it must
-	 * be quarantined (retained, never freed back to the app heap) — exactly
-	 * like the back/front buffer staging in DSpReleaseFrontBufferStaging. */
+	 * be quarantined (retained, never freed back to the app heap), like the
+	 * guest-visible back-buffer fallback staging. */
 	if (rec->baseaddr_owned_staging && rec->baseaddr_mac != 0) {
 		DSpQuarantineGuestPixelStaging(rec->baseaddr_mac,
-		                               rec->baseaddr_size, true);
+									   rec->baseaddr_size, true);
 	}
 	rec->in_use            = false;
-	rec->texture           = nil;   /* texture is a view over backing — drop it first */
-	if (rec->backing != nil) {
-		gfxaccel_resources_clear_buffer_owner((__bridge void *)rec->backing);
+	rec->texture           = NULL;   /* texture is a view over backing - drop it first */
+	if (rec->backing != NULL) {
+		gfxaccel_resources_clear_buffer_owner(rec->backing);
 		gfxaccel_resources_heap_note_allocation_released(kHeapEngineDSp);
 	}
-	rec->backing           = nil;   /* DSp heap resets when all DSp buffers are idle */
+	rec->backing           = NULL;   /* DSp heap resets when all DSp buffers are idle */
 	rec->cgrafptr_mac_addr = 0;
 	rec->baseaddr_mac      = 0;
 	rec->baseaddr_size     = 0;
@@ -94,6 +88,7 @@ static void DSpClearAltBufferRecord(DSpAltBufferRecord *rec)
 	rec->width             = 0;
 	rec->height            = 0;
 	rec->depth             = 0;
+	rec->seed_pixmap_mac   = 0;
 	rec->options           = 0;
 	rec->underlay_capable  = false;
 	rec->dirty_left        = 0;
@@ -142,7 +137,7 @@ static void DSpFreeAltBuffer(uint32_t handle)
  *                                                                       *
  *  Real Metal-backed AltBuffer implementations reusing the              *
  *  engine-blind gfxaccel infra: each alt-buffer backs onto the          *
- *  DSp heap (kHeapEngineDSp) — NOT the one-per-engine overlay slot, so   *
+ *  DSp heap (kHeapEngineDSp) - NOT the one-per-engine overlay slot, so   *
  *  N alt-buffers coexist. A designated underlay feeds the                *
  *  DSpRestoreBackBufferFromUnderlay CPU dirty-band restore path when     *
  *  host-visible depth-matched backing is available. ZERO new concurrency *
@@ -156,105 +151,10 @@ static void DSpFreeAltBuffer(uint32_t handle)
  *  CGrafPort GetCGrafPtr emits describes that same depth, which keeps    *
  *  DSpBlit_* src/dst depths equal (Diablo II software mode draws its     *
  *  8-bpp frame into an alt buffer and Blit_Fastest's it to the front     *
- *  buffer — a fixed 32-bpp alt backing made every such blit fail with    *
+ *  buffer - a fixed 32-bpp alt backing made every such blit fail with    *
  *  a depth mismatch and the game presented nothing).                     *
  * --------------------------------------------------------------------- */
 
-/* Bytes per pixel / Metal format for an alt-buffer depth. Same depth->format
- * mapping as the back buffer (dsp_metal_renderer.mm DSpPixelFormatForDepthBits):
- * 8 -> R8Uint (indexed, CLUT unpack), 16 -> R16Uint (xRGB1555), 32 ->
- * BGRA8Unorm. Anything else is normalized to 32 at New time. */
-static inline uint32_t DSpAltBytesPerPixel(uint32_t depth)
-{
-	switch (depth) {
-		case 8:  return 1u;
-		case 16: return 2u;
-		default: return 4u;
-	}
-}
-
-static inline MTLPixelFormat DSpAltPixelFormatForDepth(uint32_t depth)
-{
-	switch (depth) {
-		case 8:  return MTLPixelFormatR8Uint;
-		case 16: return MTLPixelFormatR16Uint;
-		default: return MTLPixelFormatBGRA8Unorm;
-	}
-}
-
-/* Allocate the heap-routed depth-matched backing (MTLBuffer + texture view)
- * for an alt-buffer record. Mirrors DSpAllocateBackBuffer's heap-alloc +
- * texture-view idiom at rec->depth (set by New from the owning context;
- * persists across the background/foreground release-restore cycle). Returns
- * true on success; on failure leaves rec->backing/texture nil. */
-static bool DSpAllocAltBufferBacking(DSpAltBufferRecord *rec,
-                                     uint32_t w, uint32_t h)
-{
-	if (rec == nullptr || w == 0 || h == 0) return false;
-	const uint32_t bpp_bytes = DSpAltBytesPerPixel(rec->depth);
-
-	/* Bound the dimensions and compute the backing size in 64-bit so the
-	 * uint32 row-bytes / buffer-size products cannot overflow (which would
-	 * under-allocate for a record whose width/height are huge). The dim cap
-	 * also keeps alignedRB <= 0x3FFF so the 16-bit GetCGrafPtr rowBytes write
-	 * is always exact. Reject anything past the caps. */
-	if (w > DSP_ALT_MAX_DIM || h > DSP_ALT_MAX_DIM) {
-		DSP_LOG("DSpAllocAltBufferBacking: dims %ux%u exceed DSP_ALT_MAX_DIM=%u",
-		        w, h, (uint32_t)DSP_ALT_MAX_DIM);
-		return false;
-	}
-	uint64_t row_bytes64 = (uint64_t)w * (uint64_t)bpp_bytes;
-	uint64_t aligned64   = (row_bytes64 + 255u) & ~(uint64_t)255u;
-	uint64_t size64      = aligned64 * (uint64_t)h;
-	if (aligned64 > 0xFFFFFFFFu || size64 > DSP_ALT_MAX_BACKING_BYTES) {
-		DSP_LOG("DSpAllocAltBufferBacking: backing too large (alignedRB=%llu "
-		        "size=%llu, %ux%u) -> reject",
-		        (unsigned long long)aligned64, (unsigned long long)size64, w, h);
-		return false;
-	}
-	uint32_t alignedRB   = (uint32_t)aligned64;
-	uint32_t buffer_size = (uint32_t)size64;
-
-	void *buf_raw = gfxaccel_resources_heap_alloc_buffer(
-	    kHeapEngineDSp,                            /* per-engine DSp heap */
-	    buffer_size,
-	    (uint32_t)MTLResourceStorageModeShared);
-	if (buf_raw == NULL) {
-		DSP_LOG("DSpAllocAltBufferBacking: heap alloc failed (size=%u, %ux%u)",
-		        buffer_size, w, h);
-		return false;
-	}
-	id<MTLBuffer> buf = (__bridge_transfer id<MTLBuffer>)buf_raw;
-
-	MTLTextureDescriptor *desc = [MTLTextureDescriptor new];
-	desc.textureType = MTLTextureType2D;
-	desc.pixelFormat = DSpAltPixelFormatForDepth(rec->depth);
-	desc.width       = (NSUInteger)w;
-	desc.height      = (NSUInteger)h;
-	desc.storageMode = MTLStorageModeShared;
-	desc.usage       = MTLTextureUsageShaderRead;
-
-	id<MTLTexture> tex = [buf newTextureWithDescriptor:desc
-	                                            offset:0
-	                                       bytesPerRow:alignedRB];
-	if (tex == nil) {
-		DSP_LOG("DSpAllocAltBufferBacking: newTextureWithDescriptor returned nil "
-		        "(%ux%u alignedRB=%u)", w, h, alignedRB);
-		gfxaccel_resources_heap_note_allocation_released(kHeapEngineDSp);
-		return false;
-	}
-
-	rec->backing = buf;
-	rec->texture = tex;
-	rec->width   = w;
-	rec->height  = h;
-
-	/* Tag the backing with the DSp engine id for per-buffer ownership.
-	 * The compositor never queries this tag. */
-	gfxaccel_resources_set_buffer_owner((__bridge void *)buf,
-	                                    (uint32_t)kGfxEngineDSp);
-	return true;
-}
 
 /* --- DSpAltBuffer_NewHandler (sub-op 700) ---
  *
@@ -264,11 +164,11 @@ static bool DSpAllocAltBufferBacking(DSpAltBufferRecord *rec,
  *  p.49). A non-NULL inAttributes => overlay-kind (NOT underlay-usable).
  *  inVRAMBuffer is advisory (we always heap-back via kHeapEngineDSp).
  *  Writes the new 1-based handle to outAltBuffer. NULL outAltBuffer =>
- *  kDSpInvalidAttributesErr (ASVS V5 — guard out-ptr before write). */
+ *  kDSpInvalidAttributesErr (ASVS V5 - guard out-ptr before write). */
 extern "C" int32_t DSpAltBuffer_NewHandler(uint32_t ctxRef,
-                                           uint32_t inVRAMBuffer,
-                                           uint32_t inAttributesAddr,
-                                           uint32_t outAltBufferAddr)
+										   uint32_t inVRAMBuffer,
+										   uint32_t inAttributesAddr,
+										   uint32_t outAltBufferAddr)
 {
 	(void)inVRAMBuffer;   /* advisory; we always heap-back (PDF "may fall back to heap") */
 	if (outAltBufferAddr == 0) {
@@ -299,9 +199,9 @@ extern "C" int32_t DSpAltBuffer_NewHandler(uint32_t ctxRef,
 		 * pointer would otherwise fault the ReadMacInt32 translation layer. */
 		const uint32_t kAltAttrSize = 12u;
 		if (!NQDMetalAddrInBuffer(inAttributesAddr) ||
-		    !NQDMetalAddrInBuffer(inAttributesAddr + kAltAttrSize - 1u)) {
+			!NQDMetalAddrInBuffer(inAttributesAddr + kAltAttrSize - 1u)) {
 			DSP_LOG("AltBuffer_New: inAttributes 0x%08x out of mapped RAM -> "
-			        "kDSpInvalidAttributesErr", inAttributesAddr);
+					"kDSpInvalidAttributesErr", inAttributesAddr);
 			return kDSpInvalidAttributesErr;
 		}
 		w = ReadMacInt32(inAttributesAddr + 0);   /* DSpAltBufferAttributes.width  */
@@ -316,7 +216,7 @@ extern "C" int32_t DSpAltBuffer_NewHandler(uint32_t ctxRef,
 	 * and the row-bytes/size products cannot overflow. */
 	if (w == 0 || h == 0 || w > DSP_ALT_MAX_DIM || h > DSP_ALT_MAX_DIM) {
 		DSP_LOG("AltBuffer_New: out-of-range dims %ux%u (cap=%u) -> "
-		        "kDSpInvalidAttributesErr", w, h, (uint32_t)DSP_ALT_MAX_DIM);
+				"kDSpInvalidAttributesErr", w, h, (uint32_t)DSP_ALT_MAX_DIM);
 		return kDSpInvalidAttributesErr;
 	}
 
@@ -337,6 +237,18 @@ extern "C" int32_t DSpAltBuffer_NewHandler(uint32_t ctxRef,
 	uint32_t depth = ctx->attr.backBufferBestDepth;
 	if (depth != 8 && depth != 16 && depth != 32) depth = 32;
 	rec->depth = depth;
+	/* Alternate buffers are PixMaps for the owning display, not anonymous
+	 * bitmaps. Preserve the screen PixMap's ColorTable handle and the other
+	 * QuickDraw metadata that is independent of base/stride/bounds. This is
+	 * essential at 8 bpp: a zero pmTable makes indexed QuickDraw dereference
+	 * invalid palette state after Diablo's opening movies. */
+	const uint32_t live_pixmap = DSpGetLiveMainDevicePixMap();
+	rec->seed_pixmap_mac =
+		DSpGuestRAMContains(live_pixmap,
+						   DSpFrontBufferPixMapRecordSize(),
+						   (uint32_t)RAMBase,
+						   (uint32_t)RAMSize)
+			? live_pixmap : 0;
 
 	if (!DSpAllocAltBufferBacking(rec, w, h)) {
 		DSpFreeAltBuffer(handle);
@@ -346,7 +258,7 @@ extern "C" int32_t DSpAltBuffer_NewHandler(uint32_t ctxRef,
 
 	WriteMacInt32(outAltBufferAddr, handle);
 	DSP_LOG("AltBuffer_New: ctx=%u %ux%u@%ubpp handle=%u underlay_capable=%d",
-	        ctxRef, w, h, depth, handle, underlay_capable);
+			ctxRef, w, h, depth, handle, underlay_capable);
 	return kDSpNoErr;
 }
 
@@ -364,7 +276,7 @@ extern "C" int32_t DSpAltBuffer_DisposeHandler(uint32_t altBuffer)
 	DSpAltBufferRecord *rec = DSpGetAltBuffer(altBuffer);
 	if (rec == nullptr) {
 		DSP_LOG("AltBuffer_Dispose: unknown handle=%u -> kDSpInvalidAttributesErr",
-		        altBuffer);
+				altBuffer);
 		return kDSpInvalidAttributesErr;
 	}
 	/* Clear any context underlay/overlay designation pointing at this
@@ -381,25 +293,38 @@ extern "C" int32_t DSpAltBuffer_DisposeHandler(uint32_t altBuffer)
 }
 
 
+/* Bytes per pixel / Metal format for an alt-buffer depth. Same depth->format
+ * mapping as the back buffer (dsp_metal_renderer.mm DSpPixelFormatForDepthBits):
+ * 8 -> R8Uint (indexed, CLUT unpack), 16 -> R16Uint (xRGB1555), 32 ->
+ * BGRA8Unorm. Anything else is normalized to 32 at New time. */
+inline uint32_t DSpAltBytesPerPixel(uint32_t depth)
+{
+	switch (depth) {
+		case 8:  return 1u;
+		case 16: return 2u;
+		default: return 4u;
+	}
+}
+
 /* --- DSpAltBuffer_GetCGrafPtrHandler (sub-op 702) ---
  *
  *  DSp 1.7 PDF p.50: DSpAltBuffer_GetCGrafPtr(inAltBuffer, inBufferKind,
  *  outCGrafPtr). Returns a stable guest-RAM CGrafPort describing the alt-
  *  buffer's drawable surface (the app draws into it, then calls InvalRect).
- *  "Currently the only supported buffer kind is kDSpBufferKind_Normal" — any
+ *  "Currently the only supported buffer kind is kDSpBufferKind_Normal" - any
  *  other kind => kDSpInvalidAttributesErr. SheepMem reserve + cache the Mac
  *  address on the record + W1 staging fallback when Host2MacAddr cannot map
  *  the MTLBuffer contents pointer (arm64 iOS bump-allocator outside vm_alloc).
  *  The CGrafPort is a REAL port at the record's depth, built by the shared
  *  DSpEmitSurfaceCGrafPort emitter (classic PixMap + handle + portVersion
- *  0xC000 + vis/clip regions) — apps draw into the alt buffer by
+ *  0xC000 + vis/clip regions) - apps draw into the alt buffer by
  *  dereferencing this as a genuine port (portPixMap -> GetPixBaseAddr /
  *  CopyBits), so the former compact PixMap-shaped shim sent Diablo II's
  *  software-renderer writes through misread garbage pointers (noise on
  *  screen). NULL outCGrafPtr => kDSpInvalidAttributesErr. */
 extern "C" int32_t DSpAltBuffer_GetCGrafPtrHandler(uint32_t altBuffer,
-                                                   uint32_t bufferKind,
-                                                   uint32_t outCGrafPtrAddr)
+												   uint32_t bufferKind,
+												   uint32_t outCGrafPtrAddr)
 {
 	if (outCGrafPtrAddr == 0) {
 		DSP_LOG("AltBuffer_GetCGrafPtr: NULL outCGrafPtr -> kDSpInvalidAttributesErr");
@@ -407,13 +332,13 @@ extern "C" int32_t DSpAltBuffer_GetCGrafPtrHandler(uint32_t altBuffer,
 	}
 	if (bufferKind != (uint32_t)kDSpBufferKind_Normal) {
 		DSP_LOG("AltBuffer_GetCGrafPtr: unsupported bufferKind=%u -> "
-		        "kDSpInvalidAttributesErr (only kDSpBufferKind_Normal)", bufferKind);
+				"kDSpInvalidAttributesErr (only kDSpBufferKind_Normal)", bufferKind);
 		return kDSpInvalidAttributesErr;
 	}
 	DSpAltBufferRecord *rec = DSpGetAltBuffer(altBuffer);
 	if (rec == nullptr) {
 		DSP_LOG("AltBuffer_GetCGrafPtr: unknown handle=%u -> kDSpInvalidAttributesErr",
-		        altBuffer);
+				altBuffer);
 		return kDSpInvalidAttributesErr;
 	}
 
@@ -438,13 +363,13 @@ extern "C" int32_t DSpAltBuffer_GetCGrafPtrHandler(uint32_t altBuffer,
 
 	/* baseAddr: Mac-address view of the backing's CPU-side contents pointer.
 	 * On arm64 iOS the heap bump-allocator can live outside guest RAM.
-	 * Treat non-guest mapped values the same as 0 — W1 staging fallback
+	 * Treat non-guest mapped values the same as 0 - W1 staging fallback
 	 * reserves a guest-RAM region the size of the backing. NEVER
-	 * (uint32)(uintptr_t) — UB on arm64. */
+	 * (uint32)(uintptr_t) - UB on arm64. */
 	uint32_t baseAddr_mac = 0;
 	bool baseaddr_owned_staging = false;
-	void *contents = rec->backing.contents;        /* NULL on StorageModePrivate */
-	if (contents != NULL) {
+	void *contents = DSpGetBackingContents(rec->backing);
+	if (contents != NULL) { /* NULL on StorageModePrivate */
 		baseAddr_mac = DSpUsableGuestBaseOrZero(
 			Host2MacAddr((uint8 *)contents),
 			buffer_size,
@@ -454,7 +379,7 @@ extern "C" int32_t DSpAltBuffer_GetCGrafPtrHandler(uint32_t altBuffer,
 	if (baseAddr_mac == 0) {
 		/* The Metal backing's contents pointer is outside guest RAM (the iOS
 		 * MEM_BULK case), so expose a guest-RAM pixel-staging buffer the size
-		 * of the alt-buffer — the SAME framebuffer-staging allocator the back
+		 * of the alt-buffer - the SAME framebuffer-staging allocator the back
 		 * buffer uses (Mac system heap via NewPtrSys). NEVER
 		 * DSpReserveGuestScratch here: that is the 512 KB SheepMem thunk
 		 * stack, and a framebuffer-sized request (up to ~1.2 MB) overruns it,
@@ -463,7 +388,7 @@ extern "C" int32_t DSpAltBuffer_GetCGrafPtrHandler(uint32_t altBuffer,
 		baseAddr_mac = DSpReserveGuestPixelStaging(buffer_size);
 		if (baseAddr_mac == 0) {
 			DSP_LOG("AltBuffer_GetCGrafPtr: neither Host2MacAddr nor pixel "
-			        "staging reserve(%u) vended a guest baseAddr", buffer_size);
+					"staging reserve(%u) vended a guest baseAddr", buffer_size);
 			return kDSpInternalErr;
 		}
 		baseaddr_owned_staging = true;
@@ -472,38 +397,38 @@ extern "C" int32_t DSpAltBuffer_GetCGrafPtrHandler(uint32_t altBuffer,
 	rec->baseaddr_size          = buffer_size;
 	rec->baseaddr_owned_staging = baseaddr_owned_staging;
 
-	/* Emit a REAL CGrafPort at the record's depth (shared emitter — same
+	/* Emit a REAL CGrafPort at the record's depth (shared emitter - same
 	 * construction as the front buffer). The guest dereferences this as a
 	 * genuine port (portPixMap -> pixel writes / CopyBits). */
 	uint32_t cgp_addr = DSpEmitSurfaceCGrafPort(baseAddr_mac,
-	                                            w, h,
-	                                            rec->depth,
-	                                            alignedRB,
-	                                            0 /* zero-init PixMap */,
-	                                            nullptr, nullptr);
+												w, h,
+												rec->depth,
+												alignedRB,
+												rec->seed_pixmap_mac,
+												nullptr, nullptr);
 	if (cgp_addr == 0) {
 		DSP_LOG("AltBuffer_GetCGrafPtr: CGrafPort emission failed "
-		        "(handle=%u %ux%u@%u)", altBuffer, w, h, rec->depth);
+				"(handle=%u %ux%u@%u)", altBuffer, w, h, rec->depth);
 		return kDSpInternalErr;
 	}
 
 	rec->cgrafptr_mac_addr = cgp_addr;
 	WriteMacInt32(outCGrafPtrAddr, cgp_addr);
 	DSP_LOG("AltBuffer_GetCGrafPtr: handle=%u cgrafptr=0x%08x baseAddr=0x%08x "
-	        "rb=%u bpp=%u (real port)", altBuffer, cgp_addr, baseAddr_mac,
-	        alignedRB, rec->depth);
+			"rb=%u bpp=%u (real port)", altBuffer, cgp_addr, baseAddr_mac,
+			alignedRB, rec->depth);
 	return kDSpNoErr;
 }
 
 
 /* Per-alt-buffer dirty-rect accumulator. Clamps to the alt-buffer's bounds
- * (ASVS V5) then unions into the record's dirty rect — same shape + semantics
+ * (ASVS V5) then unions into the record's dirty rect - same shape + semantics
  * as DSpInvalBackBufferRect_Accumulate (the back-buffer dirty accumulator),
  * single-writer, NO sync primitive. The union flows into the GetBackBuffer
  * underlay-restore on the next retrieval (sub-op 705 commit). */
 static void DSpAltBufferInvalRect_Accumulate(DSpAltBufferRecord *rec,
-                                             int16_t top, int16_t left,
-                                             int16_t bottom, int16_t right)
+											 int16_t top, int16_t left,
+											 int16_t bottom, int16_t right)
 {
 	if (rec == nullptr) return;
 
@@ -544,7 +469,7 @@ static void DSpAltBufferInvalRect_Accumulate(DSpAltBufferRecord *rec,
  *  dirty rect. NULL inInvalidRect / unknown handle ->
  *  kDSpInvalidAttributesErr. */
 extern "C" int32_t DSpAltBuffer_InvalRectHandler(uint32_t altBuffer,
-                                                 uint32_t inInvalidRectAddr)
+												 uint32_t inInvalidRectAddr)
 {
 	if (inInvalidRectAddr == 0) {
 		DSP_LOG("AltBuffer_InvalRect: NULL rect -> kDSpInvalidAttributesErr");
@@ -553,7 +478,7 @@ extern "C" int32_t DSpAltBuffer_InvalRectHandler(uint32_t altBuffer,
 	DSpAltBufferRecord *rec = DSpGetAltBuffer(altBuffer);
 	if (rec == nullptr) {
 		DSP_LOG("AltBuffer_InvalRect: unknown handle=%u -> kDSpInvalidAttributesErr",
-		        altBuffer);
+				altBuffer);
 		return kDSpInvalidAttributesErr;
 	}
 	int16_t top    = (int16_t)ReadMacInt16(inInvalidRectAddr + 0);
@@ -562,10 +487,10 @@ extern "C" int32_t DSpAltBuffer_InvalRectHandler(uint32_t altBuffer,
 	int16_t right  = (int16_t)ReadMacInt16(inInvalidRectAddr + 6);
 	DSpAltBufferInvalRect_Accumulate(rec, top, left, bottom, right);
 	DSP_LOG("AltBuffer_InvalRect: handle=%u rect=(%d,%d)-(%d,%d) "
-	        "union=(%d,%d)-(%d,%d) empty=%d",
-	        altBuffer, top, left, bottom, right,
-	        rec->dirty_top, rec->dirty_left, rec->dirty_bottom, rec->dirty_right,
-	        rec->dirty_empty);
+			"union=(%d,%d)-(%d,%d) empty=%d",
+			altBuffer, top, left, bottom, right,
+			rec->dirty_top, rec->dirty_left, rec->dirty_bottom, rec->dirty_right,
+			rec->dirty_empty);
 	return kDSpNoErr;
 }
 
@@ -575,37 +500,37 @@ extern "C" int32_t DSpAltBuffer_InvalRectHandler(uint32_t altBuffer,
  *  DSp 1.7 PDF p.51: DSpContext_SetUnderlayAltBuffer(inContext, inNewUnderlay).
  *  Designates an alt-buffer as the context's underlay. "When a back buffer is
  *  retrieved and there is an underlay buffer, the invalid areas in the back
- *  buffer are restored from the underlay buffer" — that restore is the
+ *  buffer are restored from the underlay buffer" - that restore is the
  *  GetBackBuffer branch below. inNewUnderlay == 0 clears the designation
  *  (no underlay). A non-zero handle must resolve to an alt-buffer that is
- *  underlay-capable (NULL-attributes kind, PDF p.49) — else
+ *  underlay-capable (NULL-attributes kind, PDF p.49) - else
  *  kDSpInvalidAttributesErr. Bad ctxRef -> kDSpInvalidContextErr. */
 extern "C" int32_t DSpContext_SetUnderlayAltBufferHandler(uint32_t ctxRef,
-                                                          uint32_t inNewUnderlay)
+														  uint32_t inNewUnderlay)
 {
 	DSpContextPrivate *ctx = DSpGetContext(ctxRef);
 	if (ctx == nullptr) {
 		DSP_LOG("SetUnderlayAltBuffer: invalid ctxRef=%u -> kDSpInvalidContextErr",
-		        ctxRef);
+				ctxRef);
 		return kDSpInvalidContextErr;
 	}
 	if (inNewUnderlay != 0) {
 		DSpAltBufferRecord *rec = DSpGetAltBuffer(inNewUnderlay);
 		if (rec == nullptr) {
 			DSP_LOG("SetUnderlayAltBuffer: unknown alt-buffer=%u -> "
-			        "kDSpInvalidAttributesErr", inNewUnderlay);
+					"kDSpInvalidAttributesErr", inNewUnderlay);
 			return kDSpInvalidAttributesErr;
 		}
 		if (!rec->underlay_capable) {
 			DSP_LOG("SetUnderlayAltBuffer: alt-buffer=%u is overlay-kind (created "
-			        "with non-NULL attributes) -> kDSpInvalidAttributesErr (PDF p.49)",
-			        inNewUnderlay);
+					"with non-NULL attributes) -> kDSpInvalidAttributesErr (PDF p.49)",
+					inNewUnderlay);
 			return kDSpInvalidAttributesErr;
 		}
 	}
 	ctx->underlay_alt_buffer = inNewUnderlay;
 	DSP_LOG("SetUnderlayAltBuffer: ctx=%u underlay=%u",
-	        ctxRef, inNewUnderlay);
+			ctxRef, inNewUnderlay);
 	return kDSpNoErr;
 }
 
@@ -617,12 +542,12 @@ extern "C" int32_t DSpContext_SetUnderlayAltBufferHandler(uint32_t ctxRef,
  *  NULL outUnderlay -> kDSpInvalidAttributesErr; bad ctxRef ->
  *  kDSpInvalidContextErr. */
 extern "C" int32_t DSpContext_GetUnderlayAltBufferHandler(uint32_t ctxRef,
-                                                          uint32_t outUnderlayAddr)
+														  uint32_t outUnderlayAddr)
 {
 	DSpContextPrivate *ctx = DSpGetContext(ctxRef);
 	if (ctx == nullptr) {
 		DSP_LOG("GetUnderlayAltBuffer: invalid ctxRef=%u -> kDSpInvalidContextErr",
-		        ctxRef);
+				ctxRef);
 		return kDSpInvalidContextErr;
 	}
 	if (outUnderlayAddr == 0) {
@@ -641,18 +566,18 @@ extern "C" int32_t DSpContext_GetUnderlayAltBufferHandler(uint32_t ctxRef,
  * the guest-RAM staging; the Metal backing is a separate allocation that would
  * otherwise stay empty. Both sides are the record's depth at the same
  * 256-aligned row stride, so a flat copy of the backing extent is exact. No-op
- * on StorageModePrivate (simulator — contents NULL) or when the alt-buffer has
+ * on StorageModePrivate (simulator - contents NULL) or when the alt-buffer has
  * no owned guest staging. */
 void DSpSyncAltBufferStagingToBacking(DSpAltBufferRecord *rec)
 {
-	if (rec == nullptr || rec->backing == nil) return;
+	if (rec == nullptr || rec->backing == NULL) return;
 	if (rec->baseaddr_mac == 0 || !rec->baseaddr_owned_staging) return;
-	void *dst = rec->backing.contents;        /* NULL on StorageModePrivate */
-	if (dst == NULL) return;
+	void *dst = DSpGetBackingContents(rec->backing);
+	if (dst == NULL) return; /* NULL on StorageModePrivate */
 	uint8_t *src = Mac2HostAddr(rec->baseaddr_mac);
 	if (src == NULL) return;
 	uint32_t alignedRB  = ((rec->width * DSpAltBytesPerPixel(rec->depth))
-	                       + 255u) & ~255u;
+						   + 255u) & ~255u;
 	uint32_t copy_bytes = alignedRB * rec->height;
 	if (rec->baseaddr_size != 0 && copy_bytes > rec->baseaddr_size)
 		copy_bytes = rec->baseaddr_size;       /* never read past the staging block */
@@ -666,7 +591,7 @@ void DSpSyncAltBufferStagingToBacking(DSpAltBufferRecord *rec)
  * GetCGrafPtr CGrafPort, and DSpSyncAltBufferStagingToBacking rebuilds the
  * backing from it. Alt-buffer backings therefore release on background and
  * re-create on foreground exactly like back buffers. Without this, any title
- * holding one alt buffer kept the DSp heap live count nonzero forever — the
+ * holding one alt buffer kept the DSp heap live count nonzero forever - the
  * bump heap could never reset, and every background/foreground cycle leaked
  * a back-buffer-sized region toward the 32 MiB ceiling (CORE-09 ratchet). */
 void DSpReleaseAltBufferBackingsForBackground(void)
@@ -674,13 +599,13 @@ void DSpReleaseAltBufferBackingsForBackground(void)
 	uint32_t released = 0;
 	for (int i = 0; i < DSP_MAX_ALT_BUFFERS; i++) {
 		DSpAltBufferRecord *rec = &dsp_alt_buffer_table[i];
-		if (!rec->in_use || rec->backing == nil) continue;
-		/* Texture is a view over the backing — drop it first. Guest
+		if (!rec->in_use || rec->backing == NULL) continue;
+		/* Texture is a view over the backing - drop it first. Guest
 		 * staging, dims, and in_use stay intact for foreground restore. */
-		rec->texture = nil;
-		gfxaccel_resources_clear_buffer_owner((__bridge void *)rec->backing);
+		rec->texture = NULL;
+		gfxaccel_resources_clear_buffer_owner(rec->backing);
 		gfxaccel_resources_heap_note_allocation_released(kHeapEngineDSp);
-		rec->backing = nil;
+		rec->backing = NULL;
 		released++;
 	}
 	if (released > 0) {
@@ -693,19 +618,19 @@ void DSpRestoreAltBufferBackingsForForeground(void)
 {
 	for (int i = 0; i < DSP_MAX_ALT_BUFFERS; i++) {
 		DSpAltBufferRecord *rec = &dsp_alt_buffer_table[i];
-		if (!rec->in_use || rec->backing != nil) continue;
+		if (!rec->in_use || rec->backing != NULL) continue;
 		if (rec->width == 0 || rec->height == 0) continue;
 		if (!DSpAllocAltBufferBacking(rec, rec->width, rec->height)) {
-			/* Leave backing nil — sync/blit paths nil-check it; the next
+			/* Leave backing NULL - sync/blit paths NULL-check it; the next
 			 * foreground retries, matching the back-buffer policy. */
 			DSP_LOG("Foreground: alt-buffer %d backing re-alloc FAILED "
-			        "(retry on next fg)", i + 1);
+					"(retry on next fg)", i + 1);
 			continue;
 		}
 		/* Repopulate from the guest-RAM staging (source of truth). */
 		DSpSyncAltBufferStagingToBacking(rec);
 		DSP_LOG("Foreground: alt-buffer %d backing restored (%ux%u)",
-		        i + 1, rec->width, rec->height);
+				i + 1, rec->width, rec->height);
 	}
 }
 

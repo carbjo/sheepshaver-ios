@@ -37,6 +37,7 @@
 #include "audio.h"
 #include "ether.h"
 #include "serial.h"
+#include "joymanager.h"
 #include "clip.h"
 #include "extfs.h"
 #include "macos_util.h"
@@ -212,6 +213,19 @@ void EmulOp(M68kRegisters *r, uint32 pc, int selector)
 			r->d[0] = SoundInClose(r->a[0], r->a[1]);
 			break;
 
+		case OP_JOY_OPEN:
+			r->d[0] = JoyManagerOpen(r->a[0], r->a[1]);
+			break;
+		case OP_JOY_CONTROL:
+			r->d[0] = JoyManagerControl(r->a[0], r->a[1]);
+			break;
+		case OP_JOY_STATUS:
+			r->d[0] = JoyManagerStatus(r->a[0], r->a[1]);
+			break;
+		case OP_JOY_CLOSE:
+			r->d[0] = JoyManagerClose(r->a[0], r->a[1]);
+			break;
+
 		case OP_ADBOP:				// ADBOp() replacement
 			ADBOp(r->d[0], Mac2HostAddr(ReadMacInt32(r->a[0])));
 			break;
@@ -286,12 +300,16 @@ void EmulOp(M68kRegisters *r, uint32 pc, int selector)
 		case OP_RESET:				// Early in MacOS reset
 			D(bug("*** RESET ***\n"));
 			tick_inhibit = true;
+			JoyManagerReset();
 			CDROMRemount(); // for System 7.x
 			TimerReset();
 			MacOSUtilReset();
 			EtherResetCachedAllocation();
 			ether_reset();
 			AudioReset();
+#if (defined(ENABLE_GFXACCEL) && defined(SHEEPSHAVER)) || TARGET_OS_IPHONE
+			GfxAccelResetForReboot();
+#endif
 #ifdef USE_SDL_AUDIO
 			PlayStartupSound();
 #endif
@@ -323,6 +341,8 @@ void EmulOp(M68kRegisters *r, uint32 pc, int selector)
 					TimerInterrupt();
 #endif
 					ExecuteNative(NATIVE_VIDEO_VBL);
+					JoyManagerVBL();
+					ADBVBL();
 
 					DrainPendingResourceLocks();	// DII fix: lock queued sound-component PEF handles (safe VBL context)
 
@@ -540,7 +560,6 @@ void EmulOp(M68kRegisters *r, uint32 pc, int selector)
 				idle_wait();
 			r->d[0] = (uint32)-2;
 			break;
-
 		default:
 			printf("FATAL: EMUL_OP called with bogus selector %08x\n", selector);
 			QuitEmulator();

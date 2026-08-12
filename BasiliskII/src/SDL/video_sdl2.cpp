@@ -85,6 +85,12 @@
 #import "PerformanceCounterObjCCppHeader.h"
 #import "MiscellaneousSettingsObjCCppHeader.h"
 #import "PreferencesViewControllerObjCCppHeader.h"
+#endif
+
+#if (defined(ENABLE_GFXACCEL) && defined(SHEEPSHAVER)) || TARGET_OS_IPHONE
+#include "metal_compositor.h"
+#include "display_mode_controller.h"
+#include "gfxaccel_resources.h"
 #include "nqd_accel.h"
 #endif
 
@@ -251,12 +257,31 @@ extern void SysMountFirstFloppy(void);
 /*
  *  Framebuffer allocation routines
  */
+#if (defined(ENABLE_GFXACCEL) && defined(SHEEPSHAVER)) || TARGET_OS_IPHONE
+/* Persistent oversized framebuffer aperture, mirroring PocketShaver's
+ * vm_acquire_reserved() region (80 MB, sized for 6K Retina). The RAVE
+ * engine advertises a 32 MB VRAM card (kRaveAdvertisedVRAMBytes), and
+ * ATI-aware titles (Myth II) do VRAM pointer arithmetic behind the visible
+ * frame: with only the visible frame mapped those accesses hit unmapped
+ * guest space and fault. Allocate once and never release, so the guest
+ * base address also stays stable across mode switches. */
+static void *fb_aperture = VM_MAP_FAILED;
+static const uint32 fb_aperture_size = 80 * 1024 * 1024;
+#endif
 
 static void *vm_acquire_framebuffer(uint32 size)
 {
-#ifdef HAVE_MACH_VM
+#if defined(HAVE_MACH_VM) || defined(HAVE_MMAP_VM) && defined(__aarch64__)
 	return vm_acquire_reserved(size);
 #else
+#if (defined(ENABLE_GFXACCEL) && defined(SHEEPSHAVER)) || TARGET_OS_IPHONE
+	if (size <= fb_aperture_size) {
+		if (fb_aperture == VM_MAP_FAILED)
+			fb_aperture = vm_acquire(fb_aperture_size, VM_MAP_DEFAULT | VM_MAP_32BIT);
+		if (fb_aperture != VM_MAP_FAILED)
+			return fb_aperture;
+	}
+#endif
 	// always try to reallocate framebuffer at the same address
 	static void *fb = VM_MAP_FAILED;
 	if (fb != VM_MAP_FAILED) {
@@ -276,6 +301,10 @@ static void *vm_acquire_framebuffer(uint32 size)
 static inline void vm_release_framebuffer(void *fb, uint32 size)
 {
 #ifndef HAVE_MACH_VM
+#if (defined(ENABLE_GFXACCEL) && defined(SHEEPSHAVER)) || TARGET_OS_IPHONE
+	if (fb == fb_aperture)
+		return;		// aperture persists across mode switches
+#endif
 	vm_release(fb, size);
 #endif
 }
@@ -376,7 +405,7 @@ public:
 
 	// Called by the video driver to set the color palette (in indexed modes)
 	virtual void set_palette(uint8 *pal, int num) = 0;
-	
+
 	// Called by the video driver to set the gamma table
 	virtual void set_gamma(uint8 *gamma, int num) = 0;
 };
@@ -387,6 +416,8 @@ static vector<monitor_desc *> VideoMonitors;
 // Find Apple mode matching best specified dimensions
 static int find_apple_resolution(int xsize, int ysize)
 {
+	if (xsize == 512 && ysize == 384)
+		return APPLE_512x384;
 	if (xsize == 640 && ysize == 480)
 		return APPLE_640x480;
 	if (xsize == 800 && ysize == 600)
@@ -428,6 +459,10 @@ public:
 	bool video_open(void);
 	void video_close(void);
 };
+
+#if (defined(ENABLE_GFXACCEL) && defined(SHEEPSHAVER)) || TARGET_OS_IPHONE
+static void DMCModeDescFromVModesIndex(int idx, DMCModeDesc *out);
+#endif
 
 
 /*
@@ -489,7 +524,9 @@ static int sdl_depth_of_video_depth(int video_depth)
 static void sdl_display_dimensions(int &width, int &height)
 {
 	SDL_DisplayMode desktop_mode;
+#if TARGET_OS_IPHONE
 	desktop_mode.refresh_rate = objc_getFrameRateSetting();
+#endif
 	const int display_index = 0;	// TODO: try supporting multiple displays
 	if (SDL_GetDesktopDisplayMode(display_index, &desktop_mode) != 0) {
 		// TODO: report a warning, here?
@@ -528,7 +565,7 @@ static bool has_mode(int type, int width, int height, int depth)
 // Add mode to list of supported modes
 static void add_mode(int type, int width, int height, int resolution_id, int bytes_per_row, int depth)
 {
-#if !TARGET_OS_IPHONE
+#if !defined(TARGET_OS_IPHONE) || !TARGET_OS_IPHONE
 	// Filter out unsupported modes
 	if (!has_mode(type, width, height, depth))
 		return;
@@ -537,7 +574,7 @@ static void add_mode(int type, int width, int height, int resolution_id, int byt
 	// Fill in VideoMode entry
 	VIDEO_MODE mode;
 #ifdef SHEEPSHAVER
-#ifndef TARGET_OS_IPHONE
+#if !defined(TARGET_OS_IPHONE) || !TARGET_OS_IPHONE
 	resolution_id = find_apple_resolution(width, height);
 #endif
 	mode.viType = type;
@@ -701,16 +738,16 @@ static void delete_sdl_video_surfaces()
 		SDL_DestroyTexture(sdl_texture);
 		sdl_texture = NULL;
 	}
-	
+
 	if (host_surface) {
 		if (host_surface == guest_surface) {
 			guest_surface = NULL;
 		}
-		
+
 		SDL_FreeSurface(host_surface);
 		host_surface = NULL;
 	}
-	
+
 	if (guest_surface) {
 		SDL_FreeSurface(guest_surface);
 		guest_surface = NULL;
@@ -723,7 +760,7 @@ static void delete_sdl_video_window()
 		SDL_DestroyRenderer(sdl_renderer);
 		sdl_renderer = NULL;
 	}
-	
+
 	if (sdl_window) {
 		SDL_DestroyWindow(sdl_window);
 		sdl_window = NULL;
@@ -733,13 +770,15 @@ static void delete_sdl_video_window()
 static void shutdown_sdl_video()
 {
 	delete_sdl_video_surfaces();
-#if TARGET_OS_IPHONE
+#if (defined(ENABLE_GFXACCEL) && defined(SHEEPSHAVER)) || TARGET_OS_IPHONE
 	// Reverse-order teardown.
 	// gfxaccel_resources subscribed SECOND, so it shuts down FIRST so
 	// any in-flight DMC dispatch against its detach handler completes
 	// before the compositor drops its drawable refs.
-	gfxaccel_resources_shutdown();
-	MetalCompositorShutdown();
+	if (nqd_metal_available) {
+		gfxaccel_resources_shutdown();
+		MetalCompositorShutdown();
+	}
 #endif
 	delete_sdl_video_window();
 }
@@ -757,47 +796,55 @@ static SDL_Surface *init_sdl_video(int width, int height, int depth, Uint32 flag
     if (guest_surface) {
         delete_sdl_video_surfaces();
     }
-    
+
 	int window_width = width;
 	int window_height = height;
 	Uint32 window_flags = SDL_WINDOW_ALLOW_HIGHDPI;
 	const int window_flags_to_monitor = SDL_WINDOW_FULLSCREEN;
-	
+
 	if (flags & SDL_WINDOW_FULLSCREEN) {
 		SDL_DisplayMode desktop_mode;
+#if TARGET_OS_IPHONE
 		desktop_mode.refresh_rate = objc_getFrameRateSetting();
+#endif
 		if (SDL_GetDesktopDisplayMode(0, &desktop_mode) != 0) {
 			shutdown_sdl_video();
 			return NULL;
 		}
-		window_flags |= SDL_WINDOW_FULLSCREEN_DESKTOP;
+
 		window_width = desktop_mode.w;
 		window_height = desktop_mode.h;
-#elif TARGET_OS_IPHONE
+#if TARGET_OS_IPHONE
 		window_flags |= SDL_WINDOW_FULLSCREEN_DESKTOP;
 #else
 		window_flags |= SDL_WINDOW_FULLSCREEN;
 #endif
 	}
-	
+
 	if (sdl_window) {
 		int old_window_width, old_window_height, old_window_flags;
 		SDL_GetWindowSize(sdl_window, &old_window_width, &old_window_height);
 		old_window_flags = SDL_GetWindowFlags(sdl_window);
-		if (old_window_width != window_width ||
-			old_window_height != window_height ||
+		float m = get_mag_rate();
+		if (old_window_width != m * window_width ||
+			old_window_height != m * window_height ||
 			(old_window_flags & window_flags_to_monitor) != (window_flags & window_flags_to_monitor))
 		{
 			delete_sdl_video_window();
 		}
 	}
-	
-#if !TARGET_OS_IPHONE
+
+#if !defined(TARGET_OS_IPHONE) || !TARGET_OS_IPHONE
 	SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, PrefsFindBool("scale_nearest") ? "nearest" : "linear");
 #endif
-	
+
 #if defined(__MACOSX__) && SDL_VERSION_ATLEAST(2,0,14)
 	if (MetalIsAvailable()) window_flags |= SDL_WINDOW_METAL;
+#endif
+#if defined(ENABLE_GFXACCEL) && defined(SHEEPSHAVER) \
+		&& (!defined(TARGET_OS_IPHONE) || !TARGET_OS_IPHONE)
+	/* Compositor presents via its own OpenGL context. */
+	window_flags |= SDL_WINDOW_OPENGL;
 #endif
 
 	if (!sdl_window) {
@@ -823,7 +870,7 @@ static SDL_Surface *init_sdl_video(int width, int height, int depth, Uint32 flag
 	// emulated desktop (the guest cursor then can't cover the full window). The
 	// absolute-cursor map already positions the guest; relative mouse mode uses
 	// SDL_SetRelativeMouseMode separately. So skip the grab on iOS/Catalyst.
-#if !TARGET_OS_IPHONE
+#if !defined(TARGET_OS_IPHONE) || !TARGET_OS_IPHONE
 	if (flags & SDL_WINDOW_FULLSCREEN) SDL_SetWindowGrab(sdl_window, SDL_TRUE);
 #endif
 
@@ -835,9 +882,12 @@ static SDL_Surface *init_sdl_video(int width, int height, int depth, Uint32 flag
 		did_add_event_watch = true;
 	}
 
-#if !TARGET_OS_IPHONE
 	if (!sdl_renderer) {
+#if TARGET_OS_IPHONE
+		const char *render_driver = NULL;
+#else
 		const char *render_driver = PrefsFindString("sdlrender");
+#endif
 		if (render_driver) {
 			SDL_SetHint(SDL_HINT_RENDER_DRIVER, render_driver);
 		}
@@ -869,13 +919,12 @@ static SDL_Surface *init_sdl_video(int width, int height, int depth, Uint32 flag
 		SDL_GetRendererInfo(sdl_renderer, &info);
 		printf("Using SDL_Renderer driver: %s\n", (info.name ? info.name : "(null)"));
 	}
-#endif
-    
+
     if (!sdl_update_video_mutex) {
         sdl_update_video_mutex = SDL_CreateMutex();
     }
 
-#if !TARGET_OS_IPHONE
+#if !defined(TARGET_OS_IPHONE) || !TARGET_OS_IPHONE
 	SDL_assert(sdl_texture == NULL);
 #ifdef ENABLE_VOSF
 	sdl_texture = SDL_CreateTexture(sdl_renderer, SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_STREAMING, width, height);
@@ -929,7 +978,7 @@ static SDL_Surface *init_sdl_video(int width, int height, int depth, Uint32 flag
 
     if (!host_surface) {
 #if TARGET_OS_IPHONE
-    	// On iOS, the Metal compositor handles presentation — no SDL texture
+    	// On iOS, the Metal compositor handles presentation - no SDL texture
     	// exists. Set host_surface = guest_surface to keep downstream code
     	// (objc_reportFrameRender, NQD format queries) working.
     	host_surface = guest_surface;
@@ -958,7 +1007,7 @@ static SDL_Surface *init_sdl_video(int width, int height, int depth, Uint32 flag
 #endif
     }
 
-#if !TARGET_OS_IPHONE
+#if !defined(TARGET_OS_IPHONE) || !TARGET_OS_IPHONE
 	if (SDL_RenderSetLogicalSize(sdl_renderer, width, height) != 0) {
 		printf("ERROR: Unable to set SDL rendeer's logical size (to %dx%d): %s\n",
 			   width, height, SDL_GetError());
@@ -966,7 +1015,8 @@ static SDL_Surface *init_sdl_video(int width, int height, int depth, Uint32 flag
 		return NULL;
 	}
 
-	SDL_RenderSetIntegerScale(sdl_renderer, PrefsFindBool("scale_integer") ? SDL_TRUE : SDL_FALSE);
+	const bool use_integer_scale = PrefsFindBool("scale_integer");
+	SDL_RenderSetIntegerScale(sdl_renderer, use_integer_scale ? SDL_TRUE : SDL_FALSE);
 #endif
 
     return guest_surface;
@@ -975,7 +1025,7 @@ static SDL_Surface *init_sdl_video(int width, int height, int depth, Uint32 flag
 static int present_sdl_video()
 {
 	if (SDL_RectEmpty(&sdl_update_video_rect)) return 0;
-	
+
 	if (!sdl_renderer || !sdl_texture || !guest_surface) {
 		printf("WARNING: A video mode does not appear to have been set.\n");
 		return -1;
@@ -995,7 +1045,7 @@ static int present_sdl_video()
 	// correction), the colored bars can be an unknown color.
 	SDL_SetRenderDrawColor(sdl_renderer, 0, 0, 0, 0);	// Use black
 	SDL_RenderClear(sdl_renderer);						// Clear the display
-	
+
 	// We're about to work with sdl_update_video_rect, so stop other threads from
 	// modifying it!
 	LOCK_PALETTE;
@@ -1014,7 +1064,7 @@ static int present_sdl_video()
 		}
 	}
 	UNLOCK_PALETTE; // passed potential deadlock, can unlock palette
-	
+
     // Update the host OS' texture
 	uint8_t *srcPixels = (uint8_t *)host_surface->pixels +
 		sdl_update_video_rect.y * host_surface->pitch +
@@ -1045,27 +1095,82 @@ static int present_sdl_video()
     if (SDL_RenderCopy(sdl_renderer, sdl_texture, NULL, NULL) != 0) {
 		return -1;
 	}
-	
+
     // Update the display
 	SDL_RenderPresent(sdl_renderer);
-    
+
     // Indicate success to the caller!
     return 0;
 }
+
+#ifdef SHEEPSHAVER
+bool video_get_framebuffer_drawable_rect(int *out_x, int *out_y,
+										 int *out_w, int *out_h)
+{
+	if (!sdl_window || !out_x || !out_y || !out_w || !out_h)
+		return false;
+
+	int drawable_w = 0, drawable_h = 0;
+#if defined(ENABLE_GFXACCEL) && \
+	(!defined(TARGET_OS_IPHONE) || !TARGET_OS_IPHONE)
+	SDL_GL_GetDrawableSize(sdl_window, &drawable_w, &drawable_h);
+#else
+	SDL_GetWindowSize(sdl_window, &drawable_w, &drawable_h);
+#endif
+	if (drawable_w <= 0 || drawable_h <= 0)
+		return false;
+
+	/* Guest size: prefer the live driver mode, else VModes[cur_mode]. */
+	int guest_w = 0, guest_h = 0;
+	if (drv != NULL) {
+		const VIDEO_MODE &mode = drv->mode;
+		guest_w = VIDEO_MODE_X;
+		guest_h = VIDEO_MODE_Y;
+	}
+	if ((guest_w <= 0 || guest_h <= 0) &&
+		cur_mode >= 0 && cur_mode < 64 &&
+		VModes[cur_mode].viType != DIS_INVALID) {
+		guest_w = VModes[cur_mode].viXsize;
+		guest_h = VModes[cur_mode].viYsize;
+	}
+	if (guest_w <= 0 || guest_h <= 0) {
+		*out_x = 0;
+		*out_y = 0;
+		*out_w = drawable_w;
+		*out_h = drawable_h;
+		return true;
+	}
+
+	/* Continuous aspect-fit: window is mag_rate * guest, so scale == mag_rate
+	 * for matching aspects (including 1.5). */
+	const double scale = std::min((double)drawable_w / (double)guest_w,
+								  (double)drawable_h / (double)guest_h);
+	int view_w = (int)lround((double)guest_w * scale);
+	int view_h = (int)lround((double)guest_h * scale);
+	view_w = std::max(1, std::min(drawable_w, view_w));
+	view_h = std::max(1, std::min(drawable_h, view_h));
+
+	*out_x = (drawable_w - view_w) / 2;
+	*out_y = (drawable_h - view_h) / 2;
+	*out_w = view_w;
+	*out_h = view_h;
+	return true;
+}
+#endif
 
 void update_sdl_video(SDL_Surface *s, int numrects, SDL_Rect *rects)
 {
     // TODO: make sure SDL_Renderer resources get displayed, if and when
     // MacsBug is running (and VideoInterrupt() might not get called)
-    
+
     SDL_LockMutex(sdl_update_video_mutex);
     for (int i = 0; i < numrects; ++i) {
         SDL_UnionRect(&sdl_update_video_rect, &rects[i], &sdl_update_video_rect);
     }
-#if !TARGET_OS_IPHONE
+#if TARGET_OS_IPHONE
 	// On iOS the VBL source is the authoritative FPS reporter (it counts
 	// completed VBL callback chains in vbl_source.mm; present-site counting is
-	// frozen for the nift bisection — see the NOTE in MetalCompositorPresent).
+	// frozen for the nift bisection - see the NOTE in MetalCompositorPresent).
 	// This SDL dirty-rect path is already compiled out on iOS via
 	// video_refresh_window_static, but gate the report here too so the two
 	// reporters can never double-count.
@@ -1124,7 +1229,7 @@ void driver_base::init()
 		case VIDEO_DEPTH_16BIT: pitch <<= 1; break;
 		case VIDEO_DEPTH_32BIT: pitch <<= 2; break;
 	}
-		
+
 	int aligned_height = (VIDEO_MODE_Y + 15) & ~15;
 
 #ifdef ENABLE_VOSF
@@ -1134,6 +1239,7 @@ void driver_base::init()
 	the_buffer = (uint8 *)vm_acquire_framebuffer(the_buffer_size);
 	the_buffer_copy = (uint8 *)malloc(the_buffer_size);
 	D(bug("the_buffer = %p, the_buffer_copy = %p, the_host_buffer = %p\n", the_buffer, the_buffer_copy, the_host_buffer));
+
 
 	// Check whether we can initialize the VOSF subsystem and it's profitable
 	if (!video_vosf_init(monitor)) {
@@ -1155,7 +1261,7 @@ void driver_base::init()
 		// Allocate memory for frame buffer
 		the_buffer_size = (aligned_height + 2) * pitch;
 #if TARGET_OS_IPHONE
-		// On iOS the Metal compositor reads the_buffer directly — the shadow
+		// On iOS the Metal compositor reads the_buffer directly 0 the shadow
 		// copy used by update_display_static_bbox is never consulted.
 		the_buffer_copy = NULL;
 #else
@@ -1171,8 +1277,31 @@ void driver_base::init()
 	// Set frame buffer base
 	set_mac_frame_buffer(monitor, VIDEO_MODE_DEPTH, true);
 
-#if TARGET_OS_IPHONE
+#if (defined(ENABLE_GFXACCEL) && defined(SHEEPSHAVER)) || TARGET_OS_IPHONE
 	{
+		/* The controller must exist before compositor/resource subscribers
+		 * register, but it must not be created before the video driver has
+		 * installed the framebuffer. Creating it at this exact boundary makes
+		 * generation 1 a complete, usable QuickDraw surface rather than a
+		 * geometry-only placeholder with null screen addresses. Subsequent
+		 * driver reopens already have a prepared DMC transition and retain the
+		 * outgoing snapshot until video_switch_to_mode_index commits the newly
+		 * bound surface. */
+		if (dmc_current_snapshot() == NULL) {
+			DMCModeDesc initial;
+			DMCModeDescFromVModesIndex(cur_mode, &initial);
+			initial.screen_base_mac = screen_base;
+			initial.screen_base_host =
+				screen_base != 0 ? Mac2HostAddr(screen_base) : NULL;
+			int32_t dmc_err = dmc_create(&initial);
+			if (dmc_err != kDMCNoErr) {
+				fprintf(stderr, "[DMC] dmc_create FAILED after initial "
+					"framebuffer bind (err=%d, base=0x%08x host=%p)\n",
+					(int)dmc_err, (unsigned)initial.screen_base_mac,
+					initial.screen_base_host);
+			}
+		}
+
 		int fb_width = VIDEO_MODE_X;
 		int fb_height = VIDEO_MODE_Y;
 		if (MetalCompositorIsInitialized()) {
@@ -1212,25 +1341,28 @@ void driver_base::init()
 			// no engines are registered yet.
 			int32_t gfxres_err = gfxaccel_resources_init();
 			if (gfxres_err != 0) {
-				fprintf(stderr, "[gfxaccel_resources] init FAILED (err=%d) — "
+				fprintf(stderr, "[gfxaccel_resources] init FAILED (err=%d) - "
 				                "proceeding with compositor-only framebuffer "
 				                "(fallback)\n", (int)gfxres_err);
 			}
 		}
+#if TARGET_OS_IPHONE
 		// Match the host window to the guest resolution (windowed Mac Catalyst only; a no-op
 		// in full screen or off Catalyst). Runs on the initial mode set and every guest
 		// resolution change, since both re-enter driver_base::init via video_open.
 		objc_resize_catalyst_window_for_guest(fb_width, fb_height);
+#endif
 	}
 #endif
 
 	adapt_to_video_mode();
-	
+
 	// set default B/W palette
 	sdl_palette = SDL_AllocPalette(256);
-	sdl_palette->colors[1] = (SDL_Color){ .r = 0, .g = 0, .b = 0, .a = 255 };
+	SDL_Color black = { 0, 0, 0, 255 };
+	sdl_palette->colors[1] = black;
 	SDL_SetSurfacePalette(s, sdl_palette);
-#if TARGET_OS_IPHONE
+#if (defined(ENABLE_GFXACCEL) && defined(SHEEPSHAVER)) || TARGET_OS_IPHONE
 	// Upload the initial black-and-white palette so indexed modes display correctly from frame 1.
 	{
 		uint8_t bw_pal[6] = {255,255,255, 0,0,0};
@@ -1240,8 +1372,12 @@ void driver_base::init()
 	}
 #endif
 
-#if !TARGET_OS_IPHONE
+#if !defined(TARGET_OS_IPHONE) || !TARGET_OS_IPHONE
+#ifdef SHEEPSHAVER
+	if (PrefsFindBool("init_grab") && !video_can_change_cursor()) grab_mouse();
+#else
 	if (PrefsFindBool("init_grab") && !PrefsFindBool("hardcursor")) grab_mouse();
+#endif
 #endif
 }
 
@@ -1283,9 +1419,14 @@ void driver_base::adapt_to_video_mode() {
 	sdl_update_video_rect.w = VIDEO_MODE_X;
 	sdl_update_video_rect.h = VIDEO_MODE_Y;
 	SDL_UnlockMutex(sdl_update_video_mutex);
-	
-	// Hide cursor
-	SDL_ShowCursor(hardware_cursor);
+
+	/* Recreating the host mode must not invent a Cursor Manager transition.
+	 * Preserve the guest's persistent InitCursor/HideCursor state while
+	 * rebinding the hardware plane. This matters for every accelerated mode:
+	 * Bugdom keeps a visible QuickDraw cursor above RAVE, while Diablo can
+	 * hide that plane before Glide draws its own cursor. */
+	SDL_ShowCursor(hardware_cursor &&
+		(private_data == NULL || private_data->cursorVisible));
 
 	// Set window name/class
 	set_window_name();
@@ -1296,6 +1437,7 @@ void driver_base::adapt_to_video_mode() {
 
 driver_base::~driver_base()
 {
+	ungrab_mouse(); /* TODO: Needed? */
 	restore_mouse_accel();
 
 	// HACK: Just delete instances of SDL_Surface and SDL_Texture, rather
@@ -1390,7 +1532,9 @@ void driver_base::grab_mouse(void)
 		set_window_name();
 		disable_mouse_accel();
 		ADBSetRelMouseMode(true);
-		objc_reportRelativeMouseModeEnabled();
+		#if TARGET_OS_IPHONE
+			objc_reportRelativeMouseModeDisabled();
+		#endif
 	}
 }
 
@@ -1403,7 +1547,9 @@ void driver_base::ungrab_mouse(void)
 		set_window_name();
 		restore_mouse_accel();
 		ADBSetRelMouseMode(false);
-		objc_reportRelativeMouseModeDisabled();
+		#if TARGET_OS_IPHONE
+			objc_reportRelativeMouseModeDisabled();
+		#endif
 	}
 }
 
@@ -1426,7 +1572,8 @@ static void keycode_init(void)
 		if (f == NULL) {
 			char str[256];
 			snprintf(str, sizeof(str), GetString(STR_KEYCODE_FILE_WARN), kc_path ? kc_path : KEYCODE_FILE_NAME, strerror(errno));
-			WarningAlert(str);
+			/* WarningAlert(str); */
+			fprintf(stderr, "%s\n", str);
 			return;
 		}
 
@@ -1482,7 +1629,8 @@ static void keycode_init(void)
 		if (!video_driver_found) {
 			char str[256];
 			snprintf(str, sizeof(str), GetString(STR_KEYCODE_VENDOR_WARN), video_driver ? video_driver : "", kc_path ? kc_path : KEYCODE_FILE_NAME);
-			WarningAlert(str);
+			/*WarningAlert(str);*/
+			fprintf(stderr, "%s\n", str);
 			return;
 		}
 
@@ -1538,12 +1686,13 @@ bool SDL_monitor_desc::video_open(void)
 	return true;
 }
 
-#if defined(SHEEPSHAVER) && TARGET_OS_IPHONE
+#if (defined(ENABLE_GFXACCEL) && defined(SHEEPSHAVER)) || TARGET_OS_IPHONE
 // ---------------------------------------------------------------------------
-// DMCModeDescFromVModesIndex — build a DMCModeDesc from a VModes[] index
+// DMCModeDescFromVModesIndex - build a DMCModeDesc from a VModes[] index
 //
-// Used by the display-mode-controller seam to route dmc_create()
-// at VideoInit end and dmc_request_mode_switch() at the mode-switch point.
+// Used by the display-mode-controller seam to create the initial, already
+// bound QuickDraw snapshot in driver_base::init() and prepare/commit later
+// mode switches at the emulated video-driver boundary.
 // Reads the Apple depth constant from viAppleMode and converts to the DMC
 // bit-count encoding (depth field = raw bit-count: 1, 2, 4, 8, 16, 32).
 // ---------------------------------------------------------------------------
@@ -1568,7 +1717,7 @@ static void DMCModeDescFromVModesIndex(int idx, DMCModeDesc *out)
 	out->row_bytes        = (uint32_t)VModes[idx].viRowBytes;
 	out->pitch            = out->row_bytes;
 	out->vbl_usec         = 0;     // controller/compositor will compute from objc_getFrameRateSetting()
-	out->screen_base_mac  = 0;     // not meaningful pre-Resize
+	out->screen_base_mac  = 0;     // filled only after the driver installs it
 	out->screen_base_host = NULL;
 }
 #endif /* SHEEPSHAVER && TARGET_OS_IPHONE */
@@ -1614,7 +1763,7 @@ bool VideoInit(bool classic)
 	}
 //	mouse_grabbed = objc_getShouldBootInRelativeMouseMode();//objc_getRelateiveMouseModeSettingIsAlwaysOn();
 #endif
-	
+
 	// Get screen mode from preferences
 	migrate_screen_prefs();
 	const char *mode_str = NULL;
@@ -1649,9 +1798,9 @@ bool VideoInit(bool classic)
 		default_width = sdl_display_width();
 	if (default_height <= 0)
 		default_height = sdl_display_height();
-#if !TARGET_OS_IPHONE
+#if !defined(TARGET_OS_IPHONE) || !TARGET_OS_IPHONE
 	// Desktop only: clamp an over-large requested mode down to the display.
-	// NOT on iOS / Mac Catalyst — there the screen-pref mode comes from the
+	// NOT on iOS / Mac Catalyst - there the screen-pref mode comes from the
 	// validated device resolution list (objc_getAllMonitorResolutions) and is
 	// already registered in VModes[]. SDL_GetDesktopDisplayMode reports the
 	// panel in PORTRAIT there (e.g. 1329x2056 for a 2056x1329 landscape mode),
@@ -1667,7 +1816,9 @@ bool VideoInit(bool classic)
 	// Mac screen depth follows X depth
 	screen_depth = 32;
 	SDL_DisplayMode desktop_mode;
+#if TARGET_OS_IPHONE
 	desktop_mode.refresh_rate = objc_getFrameRateSetting();
+#endif
 	if (SDL_GetDesktopDisplayMode(0, &desktop_mode) == 0) {
 		screen_depth = SDL_BITSPERPIXEL(desktop_mode.format);
 	}
@@ -1694,9 +1845,14 @@ bool VideoInit(bool classic)
 		int resolution_id;
 	}
 #ifdef SHEEPSHAVER
-	// Omit Classic resolutions
+	// Omit Classic resolutions, except 512x384: it is a real Mac mode (the
+	// built-in video size on every machine with a 12" RGB display), and titles
+	// search DrawSprocket for it by exact size. MechWarrior 2 asks for
+	// 512x384@16; when the search fails it falls back to rendering that size
+	// as a centred inset of the larger screen instead of full-screen.
 	video_modes[] = {
 		{   -1,   -1, 0x80 },
+		{  512,  384, 0x80 },
 		{  640,  480, 0x81 },
 		{  800,  600, 0x82 },
 		{ 1024,  768, 0x83 },
@@ -1729,23 +1885,35 @@ bool VideoInit(bool classic)
 			for (int i = 0; video_modes[i].w != 0; i++) {
 				const int w = video_modes[i].w;
 				const int h = video_modes[i].h;
+#if (defined(ENABLE_GFXACCEL) && defined(SHEEPSHAVER)) || TARGET_OS_IPHONE
+				/* Advertise the standard resolution table up to the desktop
+				 * size instead of capping at the initial window size - games
+				 * switch modes through the Display Manager and the window is
+				 * recreated at the new size (Diablo II requires 800x600 in
+				 * the mode list). Skip table entries duplicating the default
+				 * mode's dimensions (slot 0 already covers them). */
+				if (i > 0 && ((w == default_width && h == default_height) ||
+				              w > sdl_display_width() || h > sdl_display_height()))
+					continue;
+#else
 				if (i > 0 && (w >= default_width || h >= default_height))
 					continue;
+#endif
 				for (int d = VIDEO_DEPTH_1BIT; d <= default_depth; d++)
 					add_mode(display_type, w, h, video_modes[i].resolution_id, TrivialBytesPerRow(w, (video_depth)d), d);
 			}
 		}
 	} else if (display_type == DISPLAY_SCREEN) {
+		/* Advertise only the classic PCI-driver depth set (256 colors /
+			* Thousands / Millions), matching real late-90s hardware. The
+			* previous 1..32bpp range put SIX depth records in every Display
+			* Manager mode-list entry, and Mac OS DisplayLib mis-builds
+			* entries past the fourth depth record - apps that hunt for the
+			* 16bpp record (Myth II's monitor dialog) then read garbage
+			* width/height/caps. Real drivers never exceeded 3-4 records. */
 #if TARGET_OS_IPHONE
 		std::vector<MonitorResolution> ios_resolutions = objc_getAllMonitorResolutions();
 		for(const MonitorResolution& resolution : ios_resolutions) {
-			/* Advertise only the classic PCI-driver depth set (256 colors /
-			 * Thousands / Millions), matching real late-90s hardware. The
-			 * previous 1..32bpp range put SIX depth records in every Display
-			 * Manager mode-list entry, and Mac OS DisplayLib mis-builds
-			 * entries past the fourth depth record — apps that hunt for the
-			 * 16bpp record (Myth II's monitor dialog) then read garbage
-			 * width/height/caps. Real drivers never exceeded 3-4 records. */
 			for (int d = VIDEO_DEPTH_8BIT; d <= default_depth; d++)
 				add_mode(display_type, resolution.width, resolution.height, resolution.index, TrivialBytesPerRow(resolution.width, (video_depth)d), d);
 		}
@@ -1755,8 +1923,9 @@ bool VideoInit(bool classic)
 			const int h = video_modes[i].h;
 			if (i > 0 && (w >= default_width || h >= default_height))
 				continue;
-			for (int d = VIDEO_DEPTH_1BIT; d <= default_depth; d++)
-				add_mode(display_type, w, h, video_modes[i].resolution_id, TrivialBytesPerRow(w, (video_depth)d), d);
+			for (int d = VIDEO_DEPTH_8BIT; d <= default_depth; d++)
+				add_mode(display_type, w, h, video_modes[i].resolution_id,
+					TrivialBytesPerRow(w, (video_depth)d), d);
 		}
 #endif
 	}
@@ -1813,28 +1982,12 @@ bool VideoInit(bool classic)
 	}
 #endif
 
+#if TARGET_OS_IPHONE
 	objc_reportVideoSize(VideoModes[cur_mode].viXsize, VideoModes[cur_mode].viYsize, VideoModes[cur_mode].viAppleMode);
-
+#endif
 	int color_depth = get_customized_color_depth(default_depth);
 
 	D(bug("Return get_customized_color_depth %d\n", color_depth));
-
-#if TARGET_OS_IPHONE && defined(SHEEPSHAVER)
-	// Initialize the display-mode controller BEFORE the first compositor Init.
-	// Flow: VideoInit → monitor->video_open() → driver_base::init() →
-	// MetalCompositorInit() → dmc_subscribe("compositor"). The controller MUST
-	// exist before that subscribe lands (compositor subscribes FIRST so
-	// reverse-order enter makes it LAST).
-	{
-		DMCModeDesc initial;
-		DMCModeDescFromVModesIndex(cur_mode, &initial);
-		int32_t err = dmc_create(&initial);
-		if (err != kDMCNoErr) {
-			fprintf(stderr, "[DMC] dmc_create FAILED at VideoInit (err=%d) — "
-			                "continuing without DMC routing\n", (int)err);
-		}
-	}
-#endif
 
 	// Create SDL_monitor_desc for this (the only) display
 	SDL_monitor_desc *monitor = new SDL_monitor_desc(VideoModes, (video_depth)color_depth, default_id);
@@ -1880,11 +2033,13 @@ void SDL_monitor_desc::video_close(void)
 
 void VideoExit(void)
 {
+#if (defined(ENABLE_GFXACCEL) && defined(SHEEPSHAVER)) || TARGET_OS_IPHONE
 	// Clean up NQD Metal compute resources before tearing down displays.
 	// NQD is init'd once per session; VideoExit is the correct cleanup point.
 	if (nqd_metal_available) {
 		NQDMetalCleanup();
 	}
+#endif
 
 	// Close displays
 	vector<monitor_desc *>::iterator i, end = VideoMonitors.end();
@@ -1980,7 +2135,7 @@ static void do_toggle_fullscreen(void)
 
 	// while SetVideoMode is happening, control key up may be missed
 	ADBKeyUp(0x36);
-	
+
 	// resume redraw thread
 	toggle_fullscreen = false;
 #ifndef USE_CPU_EMUL_SERVICES
@@ -2025,7 +2180,7 @@ void VideoVBL(void)
 	if (toggle_fullscreen)
 		do_toggle_fullscreen();
 
-#if TARGET_OS_IPHONE
+#if (defined(ENABLE_GFXACCEL) && defined(SHEEPSHAVER)) || TARGET_OS_IPHONE
 	// Flush any pending batched NQD Metal dispatches before presenting,
 	// so all 2D drawing is visible in the framebuffer texture.
 	if (nqd_metal_available)
@@ -2092,7 +2247,7 @@ void video_set_palette(void)
 	}
 	monitor->set_palette(pal, n_colors);
 }
-	
+
 void video_set_gamma(int n_colors)
 {
 	monitor_desc * monitor = VideoMonitors[0];
@@ -2105,22 +2260,22 @@ void video_set_gamma(int n_colors)
 	monitor->set_gamma(gamma, n_colors);
 }
 #endif
-	
+
 void SDL_monitor_desc::set_palette(uint8 *pal, int num_in)
 {
-	
+
 	const VIDEO_MODE &mode = get_current_mode();
-	
+
 	LOCK_PALETTE;
 
 	// Convert colors to XColor array
 	int num_out = 256;
 	bool stretch = false;
-	
+
 	if (!sdl_palette) {
 		sdl_palette = SDL_AllocPalette(num_out);
 	}
-	
+
 	SDL_Color *p = sdl_palette->colors;
 	for (int i=0; i<num_out; i++) {
 		int c = (stretch ? (i * num_in) / num_out : i);
@@ -2151,7 +2306,7 @@ void SDL_monitor_desc::set_palette(uint8 *pal, int num_in)
 	// Tell redraw thread to change palette
 	sdl_palette_changed = true;
 
-#if TARGET_OS_IPHONE
+#if (defined(ENABLE_GFXACCEL) && defined(SHEEPSHAVER)) || TARGET_OS_IPHONE
 	// Update the GPU palette buffer so the Metal compositor renders correct colors
 	MetalCompositorUpdatePalette(pal, num_in);
 	// Bump DMC palette_gen so the compositor / engines can detect the CLUT change
@@ -2161,20 +2316,20 @@ void SDL_monitor_desc::set_palette(uint8 *pal, int num_in)
 
 	UNLOCK_PALETTE;
 }
-	
+
 void SDL_monitor_desc::set_gamma(uint8 *gamma, int num_in)
 {
 	// handle the gamma ramp
-		
+
 	if (gamma[0] == 127 && gamma[num_in*3-1] == 127) // solid grey
 		return; // ignore
 
 	uint16 red[256];
 	uint16 green[256];
 	uint16 blue[256];
-	
+
 	int repeats = 256 / num_in;
-			
+
 	for (int i = 0; i < num_in; i++) {
 		for (int j = 0; j < repeats; j++) {
 			red[i*repeats + j] = gamma[i*3 + 0] << 8;
@@ -2189,11 +2344,11 @@ void SDL_monitor_desc::set_gamma(uint8 *gamma, int num_in)
 		green[i] = gamma[(num_in - 1) * 3 + 1] << 8;
 		blue[i] = gamma[(num_in - 1) * 3 + 2] << 8;
 	}
-	
+
 	bool changed = (memcmp(red, last_gamma_red, 512) != 0 ||
 					memcmp(green, last_gamma_green, 512) != 0 ||
 					memcmp(blue, last_gamma_blue, 512) != 0);
-	
+
 	if (changed) {
 		memcpy(last_gamma_red, red, 512);
 		memcpy(last_gamma_green, green, 512);
@@ -2210,6 +2365,128 @@ void SDL_monitor_desc::set_gamma(uint8 *gamma, int num_in)
  */
 
 #ifdef SHEEPSHAVER
+static int16 video_switch_to_mode_index(int mode_index)
+{
+	if (mode_index < 0 || mode_index >= 64 ||
+		VModes[mode_index].viType == DIS_INVALID) {
+		return paramErr;
+	}
+
+	if (mode_index == cur_mode) {
+		if (private_data != NULL) {
+			private_data->saveBaseAddr = screen_base;
+			private_data->saveData = VModes[cur_mode].viAppleID;
+			private_data->saveMode = VModes[cur_mode].viAppleMode;
+			private_data->savePage = 0;
+		}
+		return noErr;
+	}
+
+	/* One native transition owns every host-side part of a mode change. It is
+	 * private to the emulated video driver's cscSetMode/cscSwitchMode path;
+	 * guest subsystems such as DrawSprocket reach it through Display Manager
+	 * so QuickDraw's GDevice is updated in the same transaction. */
+	const int previous_mode = cur_mode;
+#if defined(ENABLE_GFXACCEL) && defined(SHEEPSHAVER)
+	/* Close any open publish Hide/Show pair while CM is still valid, then
+	 * ignore further publish CM until the new mode is bound. */
+	video_screen_publish_cm_suspend();
+#endif
+	DisableInterrupt();
+#ifndef USE_CPU_EMUL_SERVICES
+	thread_stop_ack = false;
+	thread_stop_req = true;
+	while (!thread_stop_ack) ;
+#endif
+
+#if (defined(ENABLE_GFXACCEL) && defined(SHEEPSHAVER)) || TARGET_OS_IPHONE
+	DMCModeDesc new_mode;
+	DMCModeDescFromVModesIndex(mode_index, &new_mode);
+	int32_t dmc_err = dmc_prepare_mode_switch(&new_mode);
+	if (dmc_err != kDMCNoErr) {
+		fprintf(stderr, "[DMC] dmc_prepare_mode_switch FAILED (err=%d) - "
+			"video-driver mode switch cancelled\n",
+			(int)dmc_err);
+#ifndef USE_CPU_EMUL_SERVICES
+		thread_stop_req = false;
+#endif
+		EnableInterrupt();
+#if defined(ENABLE_GFXACCEL) && defined(SHEEPSHAVER)
+		video_screen_publish_cm_resume();
+#endif
+		return paramErr;
+	}
+#endif
+
+	cur_mode = mode_index;
+	VideoMonitors[0]->switch_to_current_mode();
+
+#if (defined(ENABLE_GFXACCEL) && defined(SHEEPSHAVER)) || TARGET_OS_IPHONE
+	DMCModeDesc bound_mode;
+	DMCModeDescFromVModesIndex(cur_mode, &bound_mode);
+	bound_mode.screen_base_mac = screen_base;
+	bound_mode.screen_base_host =
+		screen_base != 0 ? Mac2HostAddr(screen_base) : NULL;
+	if (bound_mode.screen_base_mac == 0 ||
+		bound_mode.screen_base_host == NULL) {
+		cur_mode = previous_mode;
+		VideoMonitors[0]->switch_to_current_mode();
+		(void)dmc_cancel_prepared_mode_switch();
+#ifndef USE_CPU_EMUL_SERVICES
+		thread_stop_req = false;
+#endif
+		EnableInterrupt();
+#if defined(ENABLE_GFXACCEL) && defined(SHEEPSHAVER)
+		video_screen_publish_cm_resume();
+#endif
+		return paramErr;
+	}
+	dmc_err = dmc_request_mode_switch(&bound_mode);
+	if (dmc_err != kDMCNoErr) {
+		fprintf(stderr, "[DMC] dmc_request_mode_switch commit FAILED "
+			"(err=%d) after driver installed %dx%d mode index=%d; "
+			"rolling platform mode back\n",
+			(int)dmc_err, (int)bound_mode.width, (int)bound_mode.height,
+			mode_index);
+		/* The controller has already compensated its subscribers and
+		 * republished the outgoing snapshot. Restore the platform side before
+		 * returning so that snapshot never names a different live surface. */
+		cur_mode = previous_mode;
+		VideoMonitors[0]->switch_to_current_mode();
+		if (private_data != NULL) {
+			private_data->saveBaseAddr = screen_base;
+			private_data->saveData = VModes[cur_mode].viAppleID;
+			private_data->saveMode = VModes[cur_mode].viAppleMode;
+			private_data->savePage = 0;
+		}
+#ifndef USE_CPU_EMUL_SERVICES
+		thread_stop_req = false;
+#endif
+		EnableInterrupt();
+#if defined(ENABLE_GFXACCEL) && defined(SHEEPSHAVER)
+		video_screen_publish_cm_resume();
+#endif
+		return paramErr;
+	}
+#endif
+
+	if (private_data != NULL) {
+		private_data->saveBaseAddr = screen_base;
+		private_data->saveData = VModes[cur_mode].viAppleID;
+		private_data->saveMode = VModes[cur_mode].viAppleMode;
+		private_data->savePage = 0;
+	}
+
+#ifndef USE_CPU_EMUL_SERVICES
+	thread_stop_req = false;
+#endif
+	EnableInterrupt();
+#if defined(ENABLE_GFXACCEL) && defined(SHEEPSHAVER)
+	video_screen_publish_cm_resume();
+#endif
+	return noErr;
+}
+
 int16 video_mode_change(VidLocals *csSave, uint32 ParamPtr)
 {
 	/* csMode arrives in the RELATIVE kDepthModeN namespace (0x80 = lowest
@@ -2230,59 +2507,16 @@ int16 video_mode_change(VidLocals *csSave, uint32 ParamPtr)
 	for (int i=0; VModes[i].viType != DIS_INVALID; i++) {
 		if ((req_mode == VModes[i].viAppleMode) &&
 		    (ReadMacInt32(ParamPtr + csData) == VModes[i].viAppleID)) {
-			csSave->saveMode = req_mode;
-			csSave->saveData = ReadMacInt32(ParamPtr + csData);
-			csSave->savePage = ReadMacInt16(ParamPtr + csPage);
-
-			// Disable interrupts and pause redraw thread
-			DisableInterrupt();
-			thread_stop_ack = false;
-			thread_stop_req = true;
-			while (!thread_stop_ack) ;
-
-#if TARGET_OS_IPHONE
-			// Route the mode switch through the display-mode controller
-			// seam. DMC owns its snapshot-ring state
-			// (active_owner, generation counters, palette/gamma hooks);
-			// the legacy `cur_mode` index into VModes[] is a separate
-			// compat handle consumed by the driver_base path
-			// (video_close → video_open → driver_base::init reads
-			// VModes[cur_mode] via VIDEO_MODE_INIT_MONITOR). An earlier
-			// change deleted the mirror assuming DMC would subsume the
-			// index, but the controller never writes cur_mode — causing
-			// switch_to_current_mode() to resize the Metal compositor
-			// to the OLD mode's dimensions/depth and produce garbled
-			// output (e.g. Nanosaur 640x480@16bpp switch staying at
-			// 1366x1024@APPLE_32_BIT). Restored below as an explicit,
-			// whitelisted seam — the only runtime `cur_mode` writer
-			// outside VideoInit bootstrap. See
-			// DMCWriteSiteInventoryTests allowedLineRanges rationale.
-			{
-				DMCModeDesc new_mode;
-				DMCModeDescFromVModesIndex(i, &new_mode);
-				int32_t err = dmc_request_mode_switch(&new_mode);
-				if (err != kDMCNoErr) {
-					fprintf(stderr, "[DMC] dmc_request_mode_switch FAILED (err=%d) — "
-					                "proceeding with legacy mode switch\n",
-					                (int)err);
-				}
-			}
-			// Sync the legacy VModes[] index so driver_base::init() reads
-			// the NEW mode's width/height/depth via VIDEO_MODE_INIT_MONITOR
-			// when switch_to_current_mode() reopens the display below.
-			cur_mode = i;
-#endif
-			monitor_desc *monitor = VideoMonitors[0];
-			monitor->switch_to_current_mode();
+			int16 switch_err = video_switch_to_mode_index(i);
+			if (switch_err != noErr)
+				return switch_err;
 
 			WriteMacInt32(ParamPtr + csBaseAddr, screen_base);
 			csSave->saveBaseAddr=screen_base;
 			csSave->saveData=VModes[i].viAppleID;/* First mode ... */
 			csSave->saveMode=VModes[i].viAppleMode;
 
-			// Enable interrupts and resume redraw thread
-			thread_stop_req = false;
-			EnableInterrupt();
+			csSave->savePage=ReadMacInt16(ParamPtr + csPage);
 			return noErr;
 		}
 	}
@@ -2297,10 +2531,10 @@ static bool is_cursor_in_mac_screen()
 	int cursorX, cursorY;
 	int deltaX, deltaY;
 	bool out;
-	
+
 	// TODO figure out a check for full screen mode
 	if (display_type == DISPLAY_SCREEN)
-		return true; 
+		return true;
 
 	if (display_type == DISPLAY_WINDOW) {
 
@@ -2323,7 +2557,7 @@ static bool is_cursor_in_mac_screen()
 	return false;
 }
 #endif
-	
+
 void SDL_monitor_desc::switch_to_current_mode(void)
 {
 	// Close and reopen display
@@ -2336,7 +2570,7 @@ void SDL_monitor_desc::switch_to_current_mode(void)
 	const VIDEO_MODE &mode = get_current_mode();
 	objc_reportVideoSize(VIDEO_MODE_X, VIDEO_MODE_Y, VIDEO_MODE_DEPTH);
 	objc_initOverlayViewController();
-	
+
 	if (VIDEO_MODE_DEPTH == APPLE_32_BIT) {
 		// 32-bit color -> likely switching back to Finder
 		suggest_mouse_grab = false;
@@ -2360,16 +2594,20 @@ void set_relative_mouse_enabled() {
 }
 
 void set_relative_mouse_disabled() {
+#if TARGET_OS_IPHONE
 	if (objc_getRelateiveMouseModeSettingIsAlwaysOn()) {
 		return;
 	}
+#endif
 	drv->ungrab_mouse();
 }
 
 void toggle_relative_mouse() {
+#if TARGET_OS_IPHONE
 	if (mouse_grabbed && objc_getRelateiveMouseModeSettingIsAlwaysOn()) {
 		return;
 	}
+#endif
 	drv->toggle_mouse_grab();
 }
 
@@ -2383,9 +2621,11 @@ void set_relative_mouse_automatic() {
 
 void report_relative_mouse_capability() {
 	suggest_mouse_grab = true;
+#if TARGET_OS_IPHONE
 	if (objc_getRelateiveMouseModeSettingIsAutomatic()) {
 		set_relative_mouse_enabled();
 	}
+#endif
 }
 
 void set_input_disabled(bool is_disabled) {
@@ -2635,9 +2875,9 @@ static void force_complete_window_refresh()
 // thread's queue drain (handle_events) and, on iOS/Catalyst when input is a
 // real pointer, straight from the event watch as the event is generated.
 #if TARGET_OS_IPHONE && !TARGET_OS_MACCATALYST
-// Shared iOS letterbox map: a point in SDL window space — which on iOS is
+// Shared iOS letterbox map: a point in SDL window space - which on iOS is
 // identical to UIKit UIWindow-base points (no backing-scale factor, no safe-area
-// inset, and SDL_RenderSetLogicalSize is compiled out on iOS) — mapped into the
+// inset, and SDL_RenderSetLogicalSize is compiled out on iOS) - mapped into the
 // guest framebuffer, aspect-fit and (optionally) clamped. Used by BOTH the
 // SDL-motion path (handle_mouse_event) and the app-forward path
 // (VideoMapWindowPointToGuestAndMove) so a forwarded UITouch.location(in: window)
@@ -2718,7 +2958,7 @@ static void handle_mouse_event(SDL_Event &event)
 			// Absolute touch cursor. In hover / two-finger-steering mode the app
 			// (GestureInputView) forwards ONLY the steering finger's position via
 			// VideoMapWindowPointToGuestAndMove, and SDL synthesizes an absolute
-			// cursor from EVERY active finger — so ignore SDL's own synthesized
+			// cursor from EVERY active finger - so ignore SDL's own synthesized
 			// motion whenever hover mode owns the cursor, else it bounces onto the
 			// second (click) finger (the "hop around the middle"). Buttons still
 			// flow through SDL. Outside hover mode SDL drives the cursor, mapped
@@ -2759,8 +2999,8 @@ static void handle_mouse_event(SDL_Event &event)
 // portrait on unfocus/refocus and clamps event.motion.x to the wrong width, so
 // the mouse position cannot come from SDL there. The UIKit hover/drag
 // recognizers call this (via objc_ADBMouseMovedFromWindowPoint) with the
-// pointer location in UIWindow-base coordinates — the same space
-// MetalCompositorGetPresentRect reports — and we letterbox it into the guest
+// pointer location in UIWindow-base coordinates - the same space
+// MetalCompositorGetPresentRect reports - and we letterbox it into the guest
 // framebuffer exactly like handle_mouse_event, then feed ADB directly. Buttons
 // still flow through SDL.
 extern "C" void VideoMapWindowPointToGuestAndMove(double winX, double winY)
@@ -2768,7 +3008,7 @@ extern "C" void VideoMapWindowPointToGuestAndMove(double winX, double winY)
 #if TARGET_OS_MACCATALYST
 	if (!drv) return;
 	// Relative mode: the guest consumes deltas (SDL's relative motion is the
-	// authoritative source), so this absolute-position bypass must no-op —
+	// authoritative source), so this absolute-position bypass must no-op -
 	// ADBMouseMoved() would add the mapped window point as a delta, slamming
 	// the view (e.g. Quake 3 pitches straight down on every fire-drag).
 	if (ADBIsRelativeMouseMode()) return;
@@ -2796,12 +3036,12 @@ extern "C" void VideoMapWindowPointToGuestAndMove(double winX, double winY)
 	ADBMouseMoved(fx, fy);
 #elif TARGET_OS_IPHONE
 	// iOS (iPad): GestureInputView forwards the steering finger unconditionally,
-	// but drive the guest cursor only while hover / two-finger steering owns it —
+	// but drive the guest cursor only while hover / two-finger steering owns it -
 	// otherwise SDL's own motion is authoritative and this is a no-op. Map through
 	// the SAME iOS letterbox as SDL motion (NOT the Catalyst present-rect path) so
 	// the forwarded point and any SDL motion resolve identically. Unclamped: the
 	// hover offset lands on top of this point inside ADBMouseMoved (which clamps
-	// the final cursor), so the finger must keep steering past the guest edges —
+	// the final cursor), so the finger must keep steering past the guest edges -
 	// clamping here froze horizontal motion in the letterbox bars.
 	if (!drv) return;
 	if (!ADBIsHoverModeActive()) return;
@@ -2812,7 +3052,6 @@ extern "C" void VideoMapWindowPointToGuestAndMove(double winX, double winY)
 	(void)winX; (void)winY;
 #endif
 }
-
 // possible return codes for SDL-registered event watches
 enum {
 	EVENT_DROP_FROM_QUEUE = 0,
@@ -2848,7 +3087,7 @@ static int SDLCALL on_sdl_event_generated(void *userdata, SDL_Event * event)
 			// tick costs up to a full refresh period of latency and the two
 			// beating refresh-rate cadences read as cursor jitter. It also
 			// keeps the UIKit-backed window queries on the main thread. The
-			// touch path stays queued — its ADBMouseDown/Up deliberately
+			// touch path stays queued - its ADBMouseDown/Up deliberately
 			// sleep, which must not stall the emulator thread running this
 			// pump.
 			if (drv && !ADBGetTouchInput()) {
@@ -2876,7 +3115,12 @@ static int SDLCALL on_sdl_event_generated(void *userdata, SDL_Event * event)
 				} break;
 #else
 				case SDLK_F5: {
-					if (is_hotkey_down(ks) && !PrefsFindBool("hardcursor")) {
+#ifdef SHEEPSHAVER
+					const bool can_change_cursor = video_can_change_cursor();
+#else
+					const bool can_change_cursor = PrefsFindBool("hardcursor");
+#endif
+					if (is_hotkey_down(ks) && !can_change_cursor) {
 						drv->toggle_mouse_grab();
 						return EVENT_DROP_FROM_QUEUE;
 					}
@@ -2886,7 +3130,7 @@ static int SDLCALL on_sdl_event_generated(void *userdata, SDL_Event * event)
 
 			}
 		} break;
-			
+
 		case SDL_DROPFILE:
 			CDROMDrop(event->drop.file);
 			SDL_free(event->drop.file);
@@ -2908,7 +3152,7 @@ static int SDLCALL on_sdl_event_generated(void *userdata, SDL_Event * event)
 						(display_type == DISPLAY_SCREEN && !is_full);
 					if (adjust_fullscreen) {
 						do_toggle_fullscreen();
-						
+
 #if __MACOSX__
 						// HACK-FIX: on OSX hosts, make sure that the OSX menu
 						// bar does not show up in fullscreen mode, when the
@@ -2923,7 +3167,7 @@ static int SDLCALL on_sdl_event_generated(void *userdata, SDL_Event * event)
 			}
 		} break;
 	}
-	
+
 	return EVENT_ADD_TO_QUEUE;
 }
 
@@ -2937,7 +3181,7 @@ static void handle_events(void)
 	while ((n_events = SDL_PeepEvents(events, n_max_events, SDL_GETEVENT, SDL_FIRSTEVENT, SDL_LASTEVENT)) > 0) {
 		for (int i = 0; i < n_events; i++) {
 			SDL_Event & event = events[i];
-			
+
 			switch (event.type) {
 
 			// Mouse
@@ -2948,7 +3192,7 @@ static void handle_events(void)
 #if TARGET_OS_IPHONE
 				// With a real pointer, live mouse events are fed to ADB as they
 				// are generated and dropped from the queue (see
-				// on_sdl_event_generated) — any mouse event still queued here
+				// on_sdl_event_generated) - any mouse event still queued here
 				// predates the video driver (launch-time window activation) and
 				// would replay as a click at the guest cursor's initial top-left
 				// position, popping the Apple menu open at boot. Only the touch
@@ -2985,7 +3229,7 @@ static void handle_events(void)
 							opt_down = true;
 						if (code == 0x37)
 							cmd_down = true;
-						
+
 					} else {
 						if (code == 0x31)
 							drv->resume();	// Space wakes us up
@@ -3012,14 +3256,14 @@ static void handle_events(void)
 				}
 				break;
 			}
-			
+
 			case SDL_WINDOWEVENT: {
 				switch (event.window.event) {
 					// Hidden parts exposed, force complete refresh of window
 					case SDL_WINDOWEVENT_EXPOSED:
 						force_complete_window_refresh();
 						break;
-					
+
 					// Force a complete window refresh when activating, to avoid redraw artifacts otherwise.
 					case SDL_WINDOWEVENT_RESTORED:
 						force_complete_window_refresh();
@@ -3080,7 +3324,7 @@ static void update_display_static(driver_base *drv)
 			const int pixels_per_byte = 8/mac_depth_of_video_depth(VIDEO_MODE_DEPTH);
 
 			const uint32 line_len = TrivialBytesPerRow(VIDEO_MODE_X, VIDEO_MODE_DEPTH);
-			
+
 			x1 = line_len;
 			for (uint32 j = y1; j <= y2; j++) {
 				p = &the_buffer[j * bytes_per_row];
@@ -3202,6 +3446,15 @@ static void update_display_static(driver_base *drv)
 // XXX use NQD bounding boxes to help detect dirty areas?
 static void update_display_static_bbox(driver_base *drv)
 {
+
+#if (defined(ENABLE_GFXACCEL) && defined(SHEEPSHAVER)) || TARGET_OS_IPHONE
+	/* Compositor presents from the_buffer via GL; the SDL-surface blit here is
+	 * vestigial and its drv->s pitch can mismatch the guest row bytes after an
+	 * in-place depth switch (overrun). Skip it when the compositor is active. */
+	if (MetalCompositorIsInitialized())
+		return;
+#endif
+
 	const VIDEO_MODE &mode = drv->mode;
 	bool blit = (int)VIDEO_MODE_DEPTH == VIDEO_DEPTH_16BIT;
 
@@ -3315,7 +3568,7 @@ static void video_refresh_dga_vosf(void)
 {
 	// Quit DGA mode if requested
 	possibly_quit_dga_mode();
-	
+
 	// Update display (VOSF variant)
 	static uint32 tick_counter = 0;
 	if (++tick_counter >= frame_skip) {
@@ -3333,7 +3586,7 @@ static void video_refresh_window_vosf(void)
 {
 	// Ungrab mouse if requested
 	possibly_ungrab_mouse();
-	
+
 	// Update display (VOSF variant)
 	static uint32 tick_counter = 0;
 	if (++tick_counter >= frame_skip) {
@@ -3354,7 +3607,7 @@ static void video_refresh_window_static(void)
 
 #if TARGET_OS_IPHONE
 	// On iOS the Metal compositor reads the shared buffer directly every
-	// VBL — the memcmp-based dirty detection (update_display_static_bbox)
+	// VBL - the memcmp-based dirty detection (update_display_static_bbox)
 	// exists only for the SDL rendering path which is not used on iOS.
 	// Skipping it avoids burning CPU and thrashing the data cache.
 #else
@@ -3498,3 +3751,4 @@ void video_set_dirty_area(int x, int y, int w, int h)
 	// XXX handle dirty bounding boxes for non-VOSF modes
 }
 #endif
+#endif // SDL version check

@@ -1,5 +1,5 @@
 /*
- *  metal_compositor.h - Metal compositor for 2D framebuffer presentation
+ *  metal_compositor.h - shared compositor interface
  *
  *  (C) 2026 Sierra Burkhart (sierra760)
  *
@@ -8,9 +8,10 @@
  *  the Free Software Foundation; either version 2 of the License, or
  *  (at your option) any later version.
  *
- *  C++ callable interface for the Metal compositor that replaces SDL's
- *  rendering pipeline on iOS. Returns void/int so this header can be
- *  included from plain .cpp files without pulling in ObjC types.
+ *  C-callable interface implemented by Metal on Apple targets and by the
+ *  desktop OpenGL compositor. The historical MetalCompositor* symbol names
+ *  remain the cross-backend ABI. Native objects travel as void* so plain C++
+ *  callers do not need Objective-C or OpenGL types.
  */
 
 #ifndef METAL_COMPOSITOR_H
@@ -26,13 +27,12 @@
  *
  * The compositor exposes a single engine-to-compositor publish entry point:
  * MetalCompositorSubmitFrame(const FrameDescriptor *desc). In production it
- * validates the FrameDescriptor, rejects stale DMC generations, caches the
- * last kLayerSlotOverlay layer in a single overlay mailbox, and returns.
- * MetalCompositorPresent is the only production path that acquires a
- * CAMetalLayer drawable, encodes, and presents.
+ * validates the FrameDescriptor and rejects stale DMC generations. Metal
+ * caches the last overlay layer; desktop GL resolves submitted screen layers
+ * immediately into the current guest framebuffer at screen_base.
+ * MetalCompositorPresent is the only final drawable presenter on either
+ * backend.
  *
- * Non-overlay slots are accepted by SubmitFrame for API compatibility but are
- * ignored in production; underlay/framebuffer composition is not implemented.
  * The compositor is engine-blind by construction: it sees only CompositeLayer
  * PODs with opaque source texture handles, never engine identifiers.
  *
@@ -54,6 +54,10 @@ typedef enum {
 	kLayerSlotCount       = 3
 } DMCLayerSlot;
 
+enum {
+	kGfxAccelMaxLayers = 16
+};
+
 /*
  * CompositeBlendMode - per-layer blend mode.
  * Covers every composite mode classic 2D and 3D engines can emit today;
@@ -68,17 +72,15 @@ typedef enum {
 /*
  * CompositeLayer - POD layer record.
  *
- * `source` is an id<MTLTexture> cast to void* so this header compiles in
- * plain .cpp files. Engines bridge-cast at their use site. The
- * source texture must be BGRA8Unorm for overlay-cache presentation.
- * Production SubmitFrame does not encode framebuffer/underlay layers.
+ * `source` is a native texture handle cast to void* so this header compiles in
+ * plain .cpp files: id<MTLTexture> on Metal, or a GLuint value on desktop GL.
  *
  * Destination rectangle fields use floats so the compositor can express
  * fractional positioning when the drawable size doesn't match the
  * framebuffer at integer multiples.
  */
 struct CompositeLayer {
-	void              *source;          /* id<MTLTexture> as void* - BGRA8Unorm */
+	void              *source;          /* native 32-bit-color texture handle */
 	uint32_t           src_origin_x;
 	uint32_t           src_origin_y;
 	uint32_t           src_size_w;
@@ -107,7 +109,7 @@ struct CompositeLayer {
  */
 struct FrameDescriptor {
 	const struct CompositeLayer *layers;
-	uint32_t                     layer_count;           /* 0..kMaxLayers (internal = 16) */
+	uint32_t                     layer_count;           /* 0..kGfxAccelMaxLayers */
 	uint32_t                     generation;            /* DMC snapshot generation */
 	uint64_t                     vbl_tick_target_usec;  /* advisory */
 };
@@ -118,7 +120,7 @@ struct FrameDescriptor {
  */
 enum GfxAccelError {
 	kGfxAccelNoErr                       =     0,
-	kGfxAccelErrInvalidDescriptor        = -4001,   /* NULL desc or layer_count > kMaxLayers or layers==NULL */
+	kGfxAccelErrInvalidDescriptor        = -4001,   /* malformed descriptor or layer */
 	kGfxAccelErrStaleGeneration          = -4002,   /* desc->generation != current snapshot gen */
 	kGfxAccelErrInvalidSlot              = -4003,   /* slot enum out of range */
 	kGfxAccelErrDrawableUnavailable      = -4004,   /* nextDrawable returned nil */
@@ -133,12 +135,12 @@ extern "C" {
 
 /*
  * Depth values correspond to VIDEO_DEPTH_* constants from video_blit.h:
- *   VIDEO_DEPTH_1BIT  — 1-bit indexed (2 colors)
- *   VIDEO_DEPTH_2BIT  — 2-bit indexed (4 colors)
- *   VIDEO_DEPTH_4BIT  — 4-bit indexed (16 colors)
- *   VIDEO_DEPTH_8BIT  — 8-bit indexed (256 colors)
- *   VIDEO_DEPTH_16BIT — 16-bit direct (xRGB1555 big-endian)
- *   VIDEO_DEPTH_32BIT — 32-bit direct (BGRA8)
+ *   VIDEO_DEPTH_1BIT  - 1-bit indexed (2 colors)
+ *   VIDEO_DEPTH_2BIT  - 2-bit indexed (4 colors)
+ *   VIDEO_DEPTH_4BIT  - 4-bit indexed (16 colors)
+ *   VIDEO_DEPTH_8BIT  - 8-bit indexed (256 colors)
+ *   VIDEO_DEPTH_16BIT - 16-bit direct (xRGB1555 big-endian)
+ *   VIDEO_DEPTH_32BIT - 32-bit direct (BGRA8)
  */
 
 /*
@@ -185,6 +187,15 @@ void MetalCompositorUpdatePalette(const uint8_t *pal, int num_colors);
 void MetalCompositorPresent(void);
 
 /*
+ * Desktop OpenGL only: present the cached frame without advancing the
+ * VBL callback chain. Guest 3D entry points use this form so a synchronous
+ * frame presentation cannot re-enter PPC code before the native thunk returns.
+ */
+#if defined(GFXACCEL_USE_OPENGL)
+void MetalCompositorPresentWithoutVBL(void);
+#endif
+
+/*
  * Tear down all Metal compositor resources.
  *
  * Removes the CompositorMetalView from the UIWindow and releases
@@ -195,19 +206,19 @@ void MetalCompositorShutdown(void);
 /*
  * Resize the Metal compositor for a resolution/depth mode switch.
  *
- * Rebuilds only the depth-dependent resources — buffer, texture, pipeline,
- * palette, and sampler — while keeping the view, layer, device, and queue
+ * Rebuilds only the depth-dependent resources - buffer, texture, pipeline,
+ * palette, and sampler - while keeping the view, layer, device, and queue
  * alive. This avoids the visual flash and UIView lifecycle overhead from a
- * full Shutdown→Init cycle. Per-engine overlay textures are managed by
+ * full Shutdown->Init cycle. Per-engine overlay textures are managed by
  * gfxaccel_resources and are re-vended by each engine in its own
  * on_mode_enter / on_mode_exit handlers.
  *
- * Threading: called from the PPC emulation thread with interrupts disabled —
+ * Threading: called from the PPC emulation thread with interrupts disabled -
  * no MetalCompositorPresent() calls can fire during resize. UIView operations
  * must NOT happen here (which is why the view stays alive).
  *
  * Precondition: compositor must already be initialized (via MetalCompositorInit).
- * If not, returns -1 and logs an error — caller should use Init instead.
+ * If not, returns -1 and logs an error - caller should use Init instead.
  *
  * Parameters: same as MetalCompositorInit.
  *
@@ -228,25 +239,31 @@ int MetalCompositorResize(int width, int height, int depth, int row_bytes,
 int MetalCompositorIsInitialized(void);
 
 /*
+ * MetalCompositorCurrentMode.
+ *
+ * Report the width/height/depth the compositor is currently configured for
+ * (what is on screen right now). Any of the out-pointers may be NULL. Returns 1
+ * if the compositor is initialized (values written), 0 otherwise (untouched).
+ *
+ * Used by video_sdl2.cpp to distinguish a depth-only switch (same resolution ->
+ * lightweight MetalCompositorResize) from a resolution switch (full reopen).
+ */
+int MetalCompositorCurrentMode(int *out_width, int *out_height, int *out_depth);
+/*
  * MetalCompositorSubmitFrame.
  *
- * Production semantics:
+ * Shared validation:
  *   1. Validate the descriptor (null / layer_count bound / slot bound /
  *      source non-null).
  *   2. Reject stale descriptors whose `generation` does not match
  *      dmc_current_snapshot()->generation with kGfxAccelErrStaleGeneration;
  *      engines drop the frame and rebuild.
- *   3. Cache the last kLayerSlotOverlay layer in the descriptor, retaining
- *      its source texture handle.
- *   4. Return kGfxAccelNoErr. No semaphore is consumed, no drawable is
- *      acquired, no render pass is encoded, and no present is issued.
  *
- * kLayerSlotUnderlay and kLayerSlotFramebuffer layers are accepted but ignored
- * in production. MetalCompositorPresent composites the cached overlay over the
- * 2D framebuffer texture every VBL; this is the sole production drawable owner
- * and presenter. Because SubmitFrame keeps a texture handle rather than a
- * snapshot, a submitted overlay texture must remain unmodified by the engine
- * until that engine's next SubmitFrame call.
+ * Metal caches the most recent overlay handle and composites it at Present.
+ * Desktop GL instead resolves every submitted layer immediately into the one
+ * guest-addressable screen. Its GL texture is only a presentation/work copy.
+ * In both cases SubmitFrame does not swap the host drawable;
+ * MetalCompositorPresent remains the sole final presenter.
  *
  * Returns kGfxAccelNoErr or one of the kGfxAccelErr* codes defined in the
  * GfxAccelError enum above.
@@ -306,6 +323,32 @@ void MetalCompositorSubmitFrame_EncodeCachedOverlay(void *render_encoder,
                                                     void *display_gamma_lut);
 void MetalCompositorSubmitFrame_ClearCachedOverlay(void);
 
+/* Legacy cache reset retained for the Metal implementation. Desktop GL has no
+ * framebuffer-layer cache and implements this as a no-op. */
+void MetalCompositorSubmitFrame_ClearCachedFramebuffer(void);
+
+/* GL only: flush a Present deferred while a RAVE/Glide FBO pass owned the
+ * shared GL context. Metal implements this as a no-op. */
+void MetalCompositorFlushDeferredPresent(void);
+
+#if defined(GFXACCEL_USE_OPENGL)
+/* Description of the currently bound guest-visible screen. The guest address,
+ * host pointer, geometry, and compositor texture always describe one logical
+ * surface. */
+struct GfxAccelScreenSurface {
+	uint32_t mac_base;
+	void    *host_base;
+	uint32_t byte_size;
+	int      width;
+	int      height;
+	int      depth;
+	int      row_bytes;
+};
+
+/* Query the canonical guest-visible screen selected by DSp/video mode state. */
+int  MetalCompositorGetScreenSurface(struct GfxAccelScreenSurface *out_surface);
+#endif
+
 
 /*
  * MetalCompositorGetLayer.
@@ -316,30 +359,6 @@ void MetalCompositorSubmitFrame_ClearCachedOverlay(void);
  * Returns NULL if the compositor is not initialized.
  */
 void *MetalCompositorGetLayer(void);
-
-/*
- * MetalCompositorGetFramebufferTexture.
- *
- * Returns the compositor-owned 2D framebuffer texture as void*
- * (id<MTLTexture>; caller bridge-casts). This is the MTLTexture view over
- * the_buffer that MetalCompositorPresent samples as fragment input — DSp
- * SwapBuffers blits its private back_texture into this texture directly; its
- * kLayerSlotFramebuffer SubmitFrame descriptor is accepted but ignored in
- * production.
- * Returns NULL if the compositor has not been
- * successfully initialized. The caller must NOT retain/release the
- * returned handle — it is owned by the compositor for the lifetime of
- * the current video mode.
- *
- * The compositor-blindness invariant is unchanged: this accessor
- * does not reference DSp — it is the same framebuffer texture handle
- * the compositor already uses internally, exposed for zero-copy blit
- * encoding from outside the .mm. NQD already writes into the backing
- * MTLBuffer via the shared-memory path; DSp instead writes into the
- * texture directly via MTLBlitCommandEncoder.copyFromTexture: so the
- * path is symmetric.
- */
-void *MetalCompositorGetFramebufferTexture(void);
 
 /*
  * MetalCompositorPaletteLatch.
@@ -363,42 +382,20 @@ void MetalCompositorPaletteLatch(void);
 void MetalCompositorUpdateGammaLUT(const uint8_t *lut);
 
 /*
- * MetalCompositorGetGammaLUTBuffer.
- *
- * Return the compositor's gamma_lut_buffer as void* (id<MTLBuffer>), or NULL
- * if uninitialized. Production accessor used by the
- * DSp 16bpp unpack render pass (dsp_metal_renderer.mm) to bind the same
- * display-ready gamma LUT the compositor present path samples.
- * The unpack path is the rare non-visible twin (DSp force-resize to
- * 32bpp routes visible pixels through compositor_fragment_32bpp).
- */
-void *MetalCompositorGetGammaLUTBuffer(void);
-
-/*
- * MetalCompositorGetGammaIdentityBuffer.
- *
- * Return the compositor's permanently-allocated identity-LUT fallback buffer
- * as void* (id<MTLBuffer>), or NULL if the compositor is uninitialized. The
- * DSp 16bpp unpack twin binds this when MetalCompositorGetGammaLUTBuffer() is
- * nil so its gamma-sampling shader never reads an unbound buffer index (UB).
- */
-void *MetalCompositorGetGammaIdentityBuffer(void);
-
-/*
  * Present-rect cache for the absolute-cursor letterbox map.
  *
  * The cursor map in video_sdl2.cpp must map the finger/pointer into the same
- * rectangle the compositor draws into — compositor_view's bounds, which on Mac
+ * rectangle the compositor draws into - compositor_view's bounds, which on Mac
  * Catalyst are pinned to the superview's safe area (NOT the full window) and
  * shift when the menu bar shows/hides on a refocus. Reading uiWindow.bounds or
  * SDL_GetWindowSize instead makes the cursor and image disagree after a
  * refocus, so the cursor can't reach the full emulated desktop.
  *
  * MetalCompositorRefreshPresentRect reads the view rect (in window coordinates,
- * the space SDL mouse events use — origin folds in the safe-area inset) and
+ * the space SDL mouse events use - origin folds in the safe-area inset) and
  * caches it; it is a no-op unless called on the main thread (pumped from
  * on_sdl_event_generated). MetalCompositorGetPresentRect returns the last cached
- * rect from any thread (size 0 before the first refresh — caller should fall
+ * rect from any thread (size 0 before the first refresh - caller should fall
  * back to an identity map).
  */
 void MetalCompositorRefreshPresentRect(void);

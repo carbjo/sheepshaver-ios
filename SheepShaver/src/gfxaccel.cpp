@@ -26,7 +26,13 @@
 #include "rave_engine.h"
 #include "gl_engine.h"
 #include "dsp_engine.h"
+#include "glide_engine.h"
 #include "nqd_accel.h"
+#include "gfx_log.h"
+#if defined(ENABLE_NATIVE_CINEPAK_PATCH) \
+		&& ENABLE_NATIVE_CINEPAK_PATCH
+#include "cinepak_hooks.h"
+#endif
 
 #define DEBUG 0
 #include "debug.h"
@@ -351,7 +357,7 @@ void NQD_fillrect(uint32 p)
 /*
  *  Decline-to-software with GPU-batch flush.
  *
- *  Returning false hands the op to software QuickDraw immediately — but up
+ *  Returning false hands the op to software QuickDraw immediately - but up
  *  to NQD_BATCH_MAX GPU dispatches against Metal-mapped RAM may still be
  *  queued. Software QD would then read/write a surface (e.g. the
  *  desktop-picture cache GWorld) BEFORE the queued GPU work lands: the
@@ -454,10 +460,25 @@ void NQD_bitblt(uint32 p)
 		const int dst_row_bytes = (int32)ReadMacInt32(p + acclDestRowBytes);
 		uint8 *src = Mac2HostAddr(ReadMacInt32(p + acclSrcBaseAddr) + (src_Y * src_row_bytes) + (src_X * bpp));
 		uint8 *dst = Mac2HostAddr(ReadMacInt32(p + acclDestBaseAddr) + (dest_Y * dst_row_bytes) + (dest_X * bpp));
-		for (int i = 0; i < height; i++) {
-			memmove(dst, src, width);
-			src += src_row_bytes;
-			dst += dst_row_bytes;
+		/* Same-surface overlap: if the destination block starts inside the
+		 * source block, top-down row order overwrites source rows before
+		 * they are read (streaks trailing a downward Finder icon drag).
+		 * Copy bottom-up in that case; memmove covers intra-row overlap. */
+		if (dst > src && dst < src + (size_t)height * src_row_bytes) {
+			src += (size_t)(height - 1) * src_row_bytes;
+			dst += (size_t)(height - 1) * dst_row_bytes;
+			for (int i = 0; i < height; i++) {
+				memmove(dst, src, width);
+				src -= src_row_bytes;
+				dst -= dst_row_bytes;
+			}
+		}
+		else {
+			for (int i = 0; i < height; i++) {
+				memmove(dst, src, width);
+				src += src_row_bytes;
+				dst += dst_row_bytes;
+			}
 		}
 	}
 	else {
@@ -465,10 +486,24 @@ void NQD_bitblt(uint32 p)
 		const int dst_row_bytes = -(int32)ReadMacInt32(p + acclDestRowBytes);
 		uint8 *src = Mac2HostAddr(ReadMacInt32(p + acclSrcBaseAddr) + ((src_Y + height - 1) * src_row_bytes) + (src_X * bpp));
 		uint8 *dst = Mac2HostAddr(ReadMacInt32(p + acclDestBaseAddr) + ((dest_Y + height - 1) * dst_row_bytes) + (dest_X * bpp));
-		for (int i = height - 1; i >= 0; i--) {
-			memmove(dst, src, width);
-			src -= src_row_bytes;
-			dst -= dst_row_bytes;
+		/* Mirror of the overlap guard above for bottom-up row storage: this
+		 * loop walks memory downward, so it corrupts when the destination
+		 * block starts BELOW the source block. Walk upward in that case. */
+		if (dst < src && src < dst + (size_t)height * dst_row_bytes) {
+			src -= (size_t)(height - 1) * src_row_bytes;
+			dst -= (size_t)(height - 1) * dst_row_bytes;
+			for (int i = 0; i < height; i++) {
+				memmove(dst, src, width);
+				src += src_row_bytes;
+				dst += dst_row_bytes;
+			}
+		}
+		else {
+			for (int i = height - 1; i >= 0; i--) {
+				memmove(dst, src, width);
+				src -= src_row_bytes;
+				dst -= dst_row_bytes;
+			}
 		}
 	}
 }
@@ -508,12 +543,12 @@ bool NQD_bitblt_hook(uint32 p)
 		NQD_bitblt_rects_byte_aligned_for_depth(p, ReadMacInt32(p + acclSrcPixelSize))) {
 		const uint32 mode = ReadMacInt32(p + acclTransferMode);
 		// The colorizing Boolean SOURCE modes
-		// (1, 3-7 — srcOr/srcBic/notSrcCopy/notSrcOr/notSrcXor/notSrcBic) at a
+		// (1, 3-7 - srcOr/srcBic/notSrcCopy/notSrcOr/notSrcXor/notSrcBic) at a
 		// COLOUR depth (multi-bit source, acclSrcPixelSize >= 8) are the general
 		// multi-bit-colour-source-under-a-Boolean-op case, whose Color-QuickDraw
 		// semantics are defined only for 1-bit-style sources (rare/ill-defined
 		// for multi-bit colour sources per IWQD). Decline these to software
-		// QuickDraw rather than invent semantics — the Metal kernel's
+		// QuickDraw rather than invent semantics - the Metal kernel's
 		// colorize arm handles ONLY the 1-bit source (bits_per_pixel == 1) case.
 		// srcCopy (0) and srcXor (2) are depth-agnostic raw copy/bitwise ops and
 		// stay accelerated at every depth; arithmetic (32-39) and hilite (50) are
@@ -529,13 +564,13 @@ bool NQD_bitblt_hook(uint32 p)
 			// family diverts overlaps to the ordered CPU scratch path inside
 			// NQDMetalBitblt (NQD-02). Packed-depth Boolean and
 			// arithmetic/hilite (32-39, 50) overlaps have no ordered route on
-			// the accelerated path — decline them to software QuickDraw
+			// the accelerated path - decline them to software QuickDraw
 			// (DELIBERATE), which observes sequential source reads.
 			if ((src_px < 8 || mode >= 32) &&
 				NQDMetalBitbltSameSurfaceOverlap(p)) {
 				// Fall through to the CPU fallback / software QuickDraw.
 			} else {
-				// All accelerated transfer modes via Metal — no pre-check on
+				// All accelerated transfer modes via Metal - no pre-check on
 				// 0x018, 0x128, 0x130, 0x15c.
 				WriteMacInt32(p + acclDrawProc, NativeTVECT(NATIVE_NQD_BITBLT));
 				return true;
@@ -544,7 +579,7 @@ bool NQD_bitblt_hook(uint32 p)
 	}
 
 	// CPU fallback: srcCopy (mode 0) with matching pixel sizes >= 8
-	// Restore mask/clip guards — CPU memmove path can't handle masked or clipped blits.
+	// Restore mask/clip guards - CPU memmove path can't handle masked or clipped blits.
 	if (ReadMacInt32(p + 0x018) + ReadMacInt32(p + 0x128) == 0 &&
 		ReadMacInt32(p + 0x130) == 0 &&
 		ReadMacInt32(p + acclSrcPixelSize) >= 8 &&
@@ -568,7 +603,7 @@ bool NQD_unknown_hook(uint32 arg)
 	return false;
 }
 
-// Mask operation hooks — validate mask data and set draw procs
+// Mask operation hooks - validate mask data and set draw procs
 // Only accept when dest (and src for bltmask) are in Metal-mapped RAM,
 // since there is no CPU fallback for masked operations.
 bool NQD_bltmask_hook(uint32 arg)
@@ -725,10 +760,46 @@ bool NQD_sync_hook(uint32 arg)
  *	Install Native QuickDraw acceleration hooks
  */
 
+// Cleared on guest soft reboot (GfxAccelResetForReboot) so VideoInstallAccel,
+// which the accRun periodic action keeps calling, reinstalls the NQD hooks into
+// the freshly reset guest instead of short-circuiting on the stale latch.
+static bool nqd_hooks_installed = false;
+
+/*
+ *	Unwind guest-facing gfxaccel registration for a guest soft reboot
+ *
+ *	A soft reboot resets the guest's driver/QuickDraw3D world (and reloads the
+ *	CFM libraries we patch), but our install latches persist across the reboot,
+ *	so the accRun -> VideoInstallAccel retry path skips reinstallation and the
+ *	fresh guest sees no accelerator (Descent II: "can't init the video card").
+ *	Clear the guest-facing latches / patches here; host GPU state is left alone.
+ *	Called from OP_RESET.
+ */
+void GfxAccelResetForReboot(void)
+{
+	QD3D_INIT_LOG("GfxAccelResetForReboot: nqdHooks=%d raveRegistered=%d",
+	              nqd_hooks_installed, RaveIsRegistered());
+	nqd_hooks_installed = false;
+	RaveResetForReboot();
+	GLResetForReboot();
+	DSpResetForReboot();
+#if !defined(TARGET_OS_IPHONE) || !TARGET_OS_IPHONE
+	if (PrefsFindBool("glideaccel"))
+		GlideResetForReboot();
+#endif
+#if defined(ENABLE_NATIVE_CINEPAK_PATCH) && ENABLE_NATIVE_CINEPAK_PATCH
+	CinepakResetForReboot();
+#endif
+}
+
 void VideoInstallAccel(void)
 {
-	// Install NQD acceleration hooks (one-time only)
-	static bool nqd_hooks_installed = false;
+	QD3D_INIT_LOG("VideoInstallAccel: gfx=%d nqd=%d rave=%d gl=%d dsp=%d registered=%d",
+	              PrefsFindBool("gfxaccel"), PrefsFindBool("nqdaccel"),
+	              PrefsFindBool("raveaccel"), PrefsFindBool("glaccel"),
+	              PrefsFindBool("dspaccel"), RaveIsRegistered());
+	// Install NQD acceleration hooks (one-time only; cleared on guest reboot
+	// by GfxAccelResetForReboot so the fresh guest gets the hooks reinstalled).
 	if (!nqd_hooks_installed && PrefsFindBool("nqdaccel")) {
 		nqd_hooks_installed = true;
 		D(bug("Video: Installing acceleration hooks\n"));
@@ -796,15 +867,21 @@ void VideoInstallAccel(void)
 	// RaveRegisterEngine has its own guards (rave_registered, rave_reg_in_progress)
 	// and returns immediately if already registered. May be called multiple times
 	// from accRun periodic action until RAVE library is available.
-	if (PrefsFindBool("raveaccel"))
+	if (PrefsFindBool("raveaccel")) {
+		QD3D_INIT_LOG("VideoInstallAccel: calling RaveRegisterEngine");
 		RaveRegisterEngine();
+		QD3D_INIT_LOG("VideoInstallAccel: RaveRegisterEngine returned, registered=%d",
+		              RaveIsRegistered());
+	} else {
+		QD3D_INIT_LOG("VideoInstallAccel: RAVE disabled by preference");
+	}
 
 	// Install OpenGL hooks for GL/AGL/GLU/GLUT function interception.
 	// GLInstallHooks has its own guards and returns immediately if already installed.
 	if (PrefsFindBool("glaccel"))
 		GLInstallHooks();
 
-	// DSp (DrawSprocket) engine — fourth engine peer to NQD/RAVE/GL.
+	// DSp (DrawSprocket) engine - fourth engine peer to NQD/RAVE/GL.
 	// Gated on "dspaccel" prefs key (default true) so users
 	// can disable cleanly to isolate regressions. Both DSpInit and the install
 	// hook live in the SAME gated branch: DSpInit registers the engine +
@@ -812,7 +889,7 @@ void VideoInstallAccel(void)
 	// hook patches the emulated-PPC DrawSprocketLib CFM symbol-table entries
 	// to redirect into our dsp_method_tvects[] thunks. The installer has
 	// its own retry-guard triplet (dsp_hooks_installed + dsp_hooks_in_progress
-	// + dsp_hooks_attempts) and caps at DSP_HOOKS_MAX_ATTEMPTS=3 — mirrors
+	// + dsp_hooks_attempts) and caps at DSP_HOOKS_MAX_ATTEMPTS=3 - mirrors
 	// GLInstallHooks wired 3 lines above. The CFM fragment may not be loaded
 	// on the first accRun tick (apps lazy-load DrawSprocketLib), so
 	// VideoInstallAccel calls into this branch on every accRun tick until
@@ -821,4 +898,22 @@ void VideoInstallAccel(void)
 		DSpInit();
 		DSpInstallHooks();
 	}
+
+	/* 3dfx Glide 2.x / 3.x */
+	#if !defined(TARGET_OS_IPHONE) || !TARGET_OS_IPHONE
+	if (PrefsFindBool("glideaccel")) {
+		GlideInstallHooks();
+	}
+	#endif
+	
+	#if defined(ENABLE_NATIVE_CINEPAK_PATCH) \
+			&& ENABLE_NATIVE_CINEPAK_PATCH
+		// Register the native Cinepak ('imdc'/'cvid') decompressor. This runs in
+		// native-op context (VideoInstallAccel is invoked via
+		// NATIVE_VIDEO_INSTALL_ACCEL), where RegisterComponent's nested guest
+		// call is safe - unlike InitCallUniversalProc's EMUL_OP context.
+		// Idempotent + retried each accRun tick until the Component Manager is
+		// up, mirroring the DSp/RAVE late-binding pattern.
+		CinepakRegisterFromNative();
+	#endif
 }
